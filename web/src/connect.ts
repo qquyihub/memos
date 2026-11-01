@@ -498,6 +498,10 @@ export const instanceServiceClient = {
     return apiRequest<any>("GET", "/api/v1/instance/profile");
   },
 
+  async getInstanceUploadConfig() {
+    return apiRequest<any>("GET", "/api/v1/instance/upload-config");
+  },
+
   async getInstanceSetting(req: { name: string }) {
     const name = req.name; // e.g. "instance/settings/GENERAL"
     const data = await apiRequest<any>("GET", `/api/v1/${name}`);
