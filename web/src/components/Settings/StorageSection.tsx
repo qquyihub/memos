@@ -16,6 +16,17 @@ import SettingSection from "./SettingSection";
 import useInstanceSettingUpdater, { buildInstanceSettingName } from "./useInstanceSettingUpdater";
 
 type StorageType = "R2" | "S3" | "WEBDAV";
+type ImageOutputFormat = "origin" | "webp" | "jpeg" | "png";
+
+const DEFAULT_FILEPATH_TEMPLATE = "{username}/{date}/{shortId}.{ext}";
+
+interface ImageProcessingSetting {
+  enabled: boolean;
+  compress: boolean;
+  quality: number;
+  maxEdge: number;
+  format: ImageOutputFormat;
+}
 
 interface S3Config {
   endpoint: string;
@@ -39,10 +50,13 @@ interface RawStorageSetting {
   uploadSizeLimitMb?: number | bigint;
   s3Config?: Partial<S3Config>;
   webdavConfig?: Partial<WebDAVConfig>;
+  imageProcessing?: Partial<ImageProcessingSetting>;
 }
 
 interface EditableStorageSetting {
   storageType: StorageType;
+  filepathTemplate: string;
+  imageProcessing: ImageProcessingSetting;
   s3: S3Config;
   webdav: WebDAVConfig;
 }
@@ -57,8 +71,25 @@ const normalizeStorageType = (value: unknown): StorageType => {
   return normalized === "S3" || normalized === "WEBDAV" ? normalized : "R2";
 };
 
+const normalizeImageFormat = (value: unknown): ImageOutputFormat => {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  return normalized === "origin" || normalized === "webp" || normalized === "jpeg" || normalized === "png" ? normalized : "webp";
+};
+
+const normalizeImageProcessing = (raw: Partial<ImageProcessingSetting> | undefined): ImageProcessingSetting => ({
+  enabled: raw?.enabled === true,
+  compress: raw?.compress !== false,
+  quality: Number.isFinite(Number(raw?.quality)) ? Number(raw?.quality) : 0.82,
+  maxEdge: Number.isFinite(Number(raw?.maxEdge)) ? Number(raw?.maxEdge) : 2560,
+  format: normalizeImageFormat(raw?.format),
+});
+
 const deriveStorageSetting = (raw: RawStorageSetting): EditableStorageSetting => ({
   storageType: normalizeStorageType(raw.storageType),
+  filepathTemplate: raw.filepathTemplate ?? "",
+  imageProcessing: normalizeImageProcessing(raw.imageProcessing),
   s3: {
     endpoint: raw.s3Config?.endpoint ?? "",
     region: raw.s3Config?.region ?? "",
@@ -129,7 +160,14 @@ const StorageSection = () => {
           value: {
             storageType: config.storageType,
             uploadSizeLimitMb: Number(rawSetting.uploadSizeLimitMb ?? 100),
-            filepathTemplate: rawSetting.filepathTemplate ?? "",
+            filepathTemplate: config.filepathTemplate.trim(),
+            imageProcessing: {
+              enabled: config.imageProcessing.enabled,
+              compress: config.imageProcessing.compress,
+              quality: Math.min(1, Math.max(0.1, config.imageProcessing.quality)),
+              maxEdge: Math.max(0, Math.round(config.imageProcessing.maxEdge)),
+              format: config.imageProcessing.format,
+            },
             s3Config,
             webdavConfig,
           },
@@ -169,6 +207,103 @@ const StorageSection = () => {
             </SelectContent>
           </Select>
         </SettingRow>
+      </SettingGroup>
+
+      <SettingGroup title={t("setting.storage.upload-path")} description={t("setting.storage.upload-path-description")}>
+        <SettingRow label={t("setting.storage.upload-path-template")} description={t("setting.storage.upload-path-template-description")}>
+          <Input
+            className="w-full font-mono sm:w-80"
+            value={config.filepathTemplate}
+            placeholder={DEFAULT_FILEPATH_TEMPLATE}
+            onChange={(event) => setConfig((prev) => ({ ...prev, filepathTemplate: event.target.value }))}
+          />
+        </SettingRow>
+      </SettingGroup>
+
+      <SettingGroup
+        title={t("setting.storage.image-preprocessing")}
+        description={t("setting.storage.image-preprocessing-description")}
+      >
+        <SettingRow
+          label={t("setting.storage.image-preprocessing-enabled")}
+          description={t("setting.storage.image-preprocessing-enabled-description")}
+        >
+          <Switch
+            checked={config.imageProcessing.enabled}
+            onCheckedChange={(checked) =>
+              setConfig((prev) => ({ ...prev, imageProcessing: { ...prev.imageProcessing, enabled: checked } }))
+            }
+          />
+        </SettingRow>
+        {config.imageProcessing.enabled && (
+          <>
+            <SettingRow
+              label={t("setting.storage.compress-images")}
+              description={t("setting.storage.compress-images-description")}
+            >
+              <Switch
+                checked={config.imageProcessing.compress}
+                onCheckedChange={(checked) =>
+                  setConfig((prev) => ({ ...prev, imageProcessing: { ...prev.imageProcessing, compress: checked } }))
+                }
+              />
+            </SettingRow>
+            <SettingRow label={t("setting.storage.output-format")} description={t("setting.storage.output-format-description")}>
+              <Select
+                value={config.imageProcessing.format}
+                onValueChange={(value) =>
+                  setConfig((prev) => ({
+                    ...prev,
+                    imageProcessing: { ...prev.imageProcessing, format: value as ImageOutputFormat },
+                  }))
+                }
+              >
+                <SelectTrigger className="w-full sm:w-64">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="origin">{t("setting.storage.output-format-origin")}</SelectItem>
+                  <SelectItem value="webp">{t("setting.storage.output-format-webp")}</SelectItem>
+                  <SelectItem value="jpeg">{t("setting.storage.output-format-jpeg")}</SelectItem>
+                  <SelectItem value="png">{t("setting.storage.output-format-png")}</SelectItem>
+                </SelectContent>
+              </Select>
+            </SettingRow>
+            <SettingRow label={t("setting.storage.compress-quality")} description={t("setting.storage.compress-quality-description")}>
+              <Input
+                className="w-full sm:w-32"
+                type="number"
+                min={0.1}
+                max={1}
+                step={0.05}
+                value={config.imageProcessing.quality}
+                onChange={(event) => {
+                  const value = Number(event.target.value);
+                  setConfig((prev) => ({
+                    ...prev,
+                    imageProcessing: { ...prev.imageProcessing, quality: Number.isFinite(value) ? value : prev.imageProcessing.quality },
+                  }));
+                }}
+              />
+            </SettingRow>
+            <SettingRow label={t("setting.storage.max-edge")} description={t("setting.storage.max-edge-description")}>
+              <Input
+                className="w-full sm:w-32"
+                type="number"
+                min={0}
+                step={1}
+                value={config.imageProcessing.maxEdge}
+                onChange={(event) => {
+                  const value = Number(event.target.value);
+                  setConfig((prev) => ({
+                    ...prev,
+                    imageProcessing: { ...prev.imageProcessing, maxEdge: Number.isFinite(value) ? value : prev.imageProcessing.maxEdge },
+                  }));
+                }}
+              />
+            </SettingRow>
+          </>
+        )}
       </SettingGroup>
 
       {config.storageType === "S3" && (

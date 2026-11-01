@@ -81,6 +81,222 @@ const requireWebDAVConfig = (config?: WebDAVStorageConfig): WebDAVStorageConfig 
   return config;
 };
 
+export type ImageOutputFormat = "origin" | "webp" | "jpeg" | "png";
+
+export interface ImageProcessingConfig {
+  enabled: boolean;
+  compress: boolean;
+  quality: number;
+  maxEdge: number;
+  format: ImageOutputFormat;
+}
+
+export interface UploadPolicy {
+  filepathTemplate: string;
+  uploadSizeLimitMb: number;
+  imageProcessing: ImageProcessingConfig;
+}
+
+export const DEFAULT_FILEPATH_TEMPLATE = "{username}/{date}/{shortId}.{ext}";
+export const DEFAULT_MAX_UPLOAD_SIZE_MB = 100;
+export const DEFAULT_IMAGE_PROCESSING: ImageProcessingConfig = {
+  enabled: false,
+  compress: true,
+  quality: 0.82,
+  maxEdge: 2560,
+  format: "webp",
+};
+
+const normalizeImageFormat = (value: unknown): ImageOutputFormat => {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  return normalized === "origin" || normalized === "webp" || normalized === "jpeg" || normalized === "png"
+    ? normalized
+    : DEFAULT_IMAGE_PROCESSING.format;
+};
+
+const normalizeImageProcessing = (raw: unknown): ImageProcessingConfig => {
+  if (!raw || typeof raw !== "object") {
+    return { ...DEFAULT_IMAGE_PROCESSING };
+  }
+
+  const parsed = raw as Partial<ImageProcessingConfig>;
+  const quality = Number(parsed.quality);
+  const maxEdge = Number(parsed.maxEdge);
+
+  return {
+    enabled: parsed.enabled === true,
+    compress: parsed.compress !== false,
+    quality: Number.isFinite(quality) && quality >= 0.1 && quality <= 1 ? quality : DEFAULT_IMAGE_PROCESSING.quality,
+    maxEdge: Number.isFinite(maxEdge) && maxEdge >= 0 ? Math.min(Math.round(maxEdge), 8192) : DEFAULT_IMAGE_PROCESSING.maxEdge,
+    format: normalizeImageFormat(parsed.format),
+  };
+};
+
+export async function getUploadPolicy(db: D1Database): Promise<UploadPolicy> {
+  const defaults: UploadPolicy = {
+    filepathTemplate: DEFAULT_FILEPATH_TEMPLATE,
+    uploadSizeLimitMb: DEFAULT_MAX_UPLOAD_SIZE_MB,
+    imageProcessing: { ...DEFAULT_IMAGE_PROCESSING },
+  };
+
+  const setting = await settingDB.getInstanceSetting(db, "STORAGE");
+  if (!setting) {
+    return defaults;
+  }
+
+  try {
+    const parsed = JSON.parse(setting.value) as {
+      filepathTemplate?: unknown;
+      uploadSizeLimitMb?: unknown;
+      imageProcessing?: unknown;
+    };
+    const limit = Number(parsed.uploadSizeLimitMb);
+    const template = typeof parsed.filepathTemplate === "string" ? parsed.filepathTemplate.trim() : "";
+
+    return {
+      filepathTemplate: template || DEFAULT_FILEPATH_TEMPLATE,
+      uploadSizeLimitMb: limit > 0 ? limit : DEFAULT_MAX_UPLOAD_SIZE_MB,
+      imageProcessing: normalizeImageProcessing(parsed.imageProcessing),
+    };
+  } catch {
+    return defaults;
+  }
+}
+
+// --- Object key naming (referenced from CloudFlare-ImgBed) ---
+
+const MIME_EXTENSIONS: Record<string, string> = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "image/avif": "avif",
+  "image/gif": "gif",
+  "image/svg+xml": "svg",
+  "video/mp4": "mp4",
+  "video/quicktime": "mov",
+  "video/webm": "webm",
+  "audio/mpeg": "mp3",
+  "audio/mp4": "m4a",
+  "audio/wav": "wav",
+  "audio/webm": "weba",
+  "application/pdf": "pdf",
+  "application/json": "json",
+  "application/zip": "zip",
+  "text/plain": "txt",
+};
+
+export const resolveFileExtension = (filename: string, mimeType: string): string => {
+  const match = filename.match(/\.([a-z0-9]{1,10})$/i);
+  if (match) {
+    return match[1].toLowerCase();
+  }
+  const mime = (mimeType || "").split(";")[0].trim().toLowerCase();
+  if (MIME_EXTENSIONS[mime]) {
+    return MIME_EXTENSIONS[mime];
+  }
+  const subtype = mime.split("/")[1]?.replace(/[^a-z0-9]/g, "");
+  return subtype || "bin";
+};
+
+const sanitizeKeySegment = (value: string, fallback: string): string => {
+  const cleaned = (value || "")
+    .replace(/[\x00-\x1f\x7f]/g, "")
+    .replace(/[\\/:*?"'<>|]+/g, "_")
+    .replace(/\.{2,}/g, "_")
+    .replace(/\s+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return cleaned || fallback;
+};
+
+const sanitizeObjectKey = (key: string): string =>
+  key
+    .split("/")
+    .map((segment) => sanitizeKeySegment(segment, ""))
+    .filter(Boolean)
+    .join("/");
+
+export interface ObjectKeyContext {
+  template: string;
+  username: string;
+  uid: string;
+  shortId: string;
+  filename: string;
+  mimeType: string;
+  timestamp: number;
+}
+
+export function renderObjectKey(context: ObjectKeyContext): string {
+  const { template, username, uid, shortId, filename, mimeType, timestamp } = context;
+  const date = new Date(timestamp * 1000);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const ext = resolveFileExtension(filename, mimeType);
+  const originName = filename.replace(/\.[^.]+$/, "") || "unnamed";
+
+  const values: Record<string, string> = {
+    username: sanitizeKeySegment(username, "user"),
+    date: `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}`,
+    year: String(date.getUTCFullYear()),
+    month: pad(date.getUTCMonth() + 1),
+    day: pad(date.getUTCDate()),
+    timestamp: String(timestamp),
+    uuid: uid,
+    shortId,
+    filename: sanitizeKeySegment(filename, "unnamed"),
+    originName: sanitizeKeySegment(originName, "unnamed"),
+    ext,
+  };
+
+  const rendered = (template.trim() || DEFAULT_FILEPATH_TEMPLATE).replace(
+    /\{([a-zA-Z]+)\}/g,
+    (match, name: string) => values[name] ?? match,
+  );
+
+  return sanitizeObjectKey(rendered);
+}
+
+export function appendUniqueSuffix(key: string, counter: number): string {
+  const slashIndex = key.lastIndexOf("/");
+  const dotIndex = key.lastIndexOf(".");
+  if (dotIndex > slashIndex && dotIndex > 0) {
+    return `${key.slice(0, dotIndex)}(${counter})${key.slice(dotIndex)}`;
+  }
+  return `${key}(${counter})`;
+}
+
+export interface StoredObjectDeletionTarget {
+  reference: string;
+  storage_type: string;
+}
+
+/**
+ * Deletes stored objects for the given attachments. Failures are logged but never
+ * thrown so that database cleanup (attachment rows, memos) can always proceed.
+ */
+export async function deleteStoredObjects(env: Env, db: D1Database, attachments: StoredObjectDeletionTarget[]): Promise<void> {
+  const backends = new Map<StorageType, ObjectStorage>();
+  let config: StorageConfig | null = null;
+
+  for (const attachment of attachments) {
+    if (!attachment.reference) {
+      continue;
+    }
+    const type = normalizeStorageType(attachment.storage_type);
+    try {
+      let backend = backends.get(type);
+      if (!backend) {
+        config ??= await getStorageConfig(db);
+        backend = createStorageBackend(env, config, type);
+        backends.set(type, backend);
+      }
+      await backend.delete(attachment.reference);
+    } catch (error) {
+      console.warn(`[storage] Failed to delete object ${attachment.reference} from ${type} storage:`, error);
+    }
+  }
+}
+
 export function createStorageBackend(env: Env, config: StorageConfig, typeOverride?: StorageType): ObjectStorage {
   const type = typeOverride ?? config.storageType;
   if (type === "S3") {

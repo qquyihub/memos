@@ -1,10 +1,16 @@
 import { Hono } from "hono";
 import type { Env, UserPayload } from "../types";
 import { authOptional, authRequired } from "../middleware/auth";
-import * as settingDB from "../db/setting";
 import { createErrorBody } from "../error";
 import { deleteCachedKeys } from "../cache";
-import { createStorageBackend, getStorageConfig, normalizeStorageType, type ObjectStorage, type StorageType } from "../storage";
+import {
+  appendUniqueSuffix,
+  createStorageBackend,
+  deleteStoredObjects,
+  getStorageConfig,
+  getUploadPolicy,
+  renderObjectKey,
+} from "../storage";
 
 type AttApp = { Bindings: Env; Variables: { user: UserPayload } };
 
@@ -124,19 +130,23 @@ async function findAttachmentsByTokens(db: D1Database, tokens: string[]): Promis
   return [...attachmentsById.values()];
 }
 
-async function deleteStoredObjects(env: Env, db: D1Database, attachments: AttachmentRow[]) {
-  const config = await getStorageConfig(db);
-  const backends = new Map<StorageType, ObjectStorage>();
-  for (const attachment of attachments) {
-    if (!attachment.reference) continue;
-    const type = normalizeStorageType(attachment.storage_type);
-    let backend = backends.get(type);
-    if (!backend) {
-      backend = createStorageBackend(env, config, type);
-      backends.set(type, backend);
-    }
-    await backend.delete(attachment.reference);
+async function findMissingMemoIds(db: D1Database, attachments: AttachmentRow[]): Promise<Set<number>> {
+  const referencedIds = [...new Set(attachments.map((att) => att.memo_id).filter((id): id is number => typeof id === "number" && id > 0))];
+  if (referencedIds.length === 0) {
+    return new Set();
   }
+
+  const existingIds = new Set<number>();
+  for (const chunk of chunkValues(referencedIds, 900)) {
+    const { results } = await db.prepare(
+      `SELECT id FROM memo WHERE id IN (${createPlaceholders(chunk.length)})`
+    ).bind(...chunk).all<{ id: number }>();
+    for (const row of results) {
+      existingIds.add(row.id);
+    }
+  }
+
+  return new Set(referencedIds.filter((id) => !existingIds.has(id)));
 }
 
 async function getAttachmentReadDeniedStatus(db: D1Database, att: AttachmentRow, user: UserPayload | undefined): Promise<401 | 403 | undefined> {
@@ -159,27 +169,55 @@ async function getAttachmentReadDeniedStatus(db: D1Database, att: AttachmentRow,
   return undefined;
 }
 
-const DEFAULT_MAX_UPLOAD_SIZE_MB = 100;
+const SHORT_ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
-const getMaxUploadSizeMb = async (db: D1Database) => {
-  const setting = await settingDB.getInstanceSetting(db, "STORAGE");
-  if (!setting) {
-    return DEFAULT_MAX_UPLOAD_SIZE_MB;
+function generateShortId(length = 8): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(length));
+  return [...bytes].map((byte) => SHORT_ID_ALPHABET[byte % SHORT_ID_ALPHABET.length]).join("");
+}
+
+async function attachmentReferenceExists(db: D1Database, reference: string): Promise<boolean> {
+  const row = await db.prepare("SELECT 1 AS found FROM attachment WHERE reference = ? LIMIT 1").bind(reference).first<{ found: number }>();
+  return Boolean(row);
+}
+
+async function buildUniqueObjectKey(
+  db: D1Database,
+  policy: { filepathTemplate: string },
+  context: { username: string; uid: string; filename: string; mimeType: string; timestamp: number },
+): Promise<string> {
+  const render = (shortId: string) =>
+    renderObjectKey({
+      template: policy.filepathTemplate,
+      username: context.username,
+      uid: context.uid,
+      shortId,
+      filename: context.filename,
+      mimeType: context.mimeType,
+      timestamp: context.timestamp,
+    });
+
+  const baseKey = render(generateShortId()) || `attachments/${context.uid}`;
+  let objectKey = baseKey;
+  let counter = 1;
+
+  while (await attachmentReferenceExists(db, objectKey)) {
+    if (counter > 1000) {
+      throw new Error("Failed to generate a unique object key");
+    }
+    objectKey = appendUniqueSuffix(baseKey, counter);
+    counter += 1;
   }
-  try {
-    const parsed = JSON.parse(setting.value) || {};
-    const limit = Number(parsed.uploadSizeLimitMb);
-    return limit > 0 ? limit : DEFAULT_MAX_UPLOAD_SIZE_MB;
-  } catch {
-    return DEFAULT_MAX_UPLOAD_SIZE_MB;
-  }
-};
+
+  return objectKey;
+}
 
 // Upload attachment
 attachmentRoutes.post("/", authRequired, async (c) => {
   const user = c.get("user");
   const contentType = c.req.header("content-type") || "";
-  const maxUploadSizeMb = await getMaxUploadSizeMb(c.env.DB);
+  const uploadPolicy = await getUploadPolicy(c.env.DB);
+  const maxUploadSizeMb = uploadPolicy.uploadSizeLimitMb;
   const maxUploadSize = maxUploadSizeMb * 1024 * 1024;
 
   let filename: string;
@@ -232,14 +270,20 @@ attachmentRoutes.post("/", authRequired, async (c) => {
   }
 
   const uid = crypto.randomUUID().replace(/-/g, "").slice(0, 22);
-  const objectKey = `attachments/${uid}/${filename}`;
+  const createdTs = nowTs();
+  const objectKey = await buildUniqueObjectKey(c.env.DB, uploadPolicy, {
+    username: user.username,
+    uid,
+    filename,
+    mimeType: fileType,
+    timestamp: createdTs,
+  });
 
   const storageConfig = await getStorageConfig(c.env.DB);
   const storage = createStorageBackend(c.env, storageConfig);
   await storage.put(objectKey, fileData, fileType);
 
   // Store metadata in D1
-  const createdTs = nowTs();
   const att = await c.env.DB.prepare(
     `INSERT INTO attachment (uid, creator_id, created_ts, updated_ts, filename, type, size, memo_id, storage_type, reference)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
@@ -266,7 +310,7 @@ attachmentRoutes.get("/", authRequired, async (c) => {
   const params: (string | number | null)[] = [user.id];
 
   if (filter.includes("memo_id == null") || filter.includes("memo == null")) {
-    whereConditions.push("memo_id IS NULL");
+    whereConditions.push("(memo_id IS NULL OR memo_id NOT IN (SELECT id FROM memo))");
   }
 
   const whereClause = `WHERE ${whereConditions.join(" AND ")}`;
@@ -282,8 +326,12 @@ attachmentRoutes.get("/", authRequired, async (c) => {
 
   const nextPageToken = offset + pageSize < total ? btoa(String(offset + pageSize)) : "";
 
+  const missingMemoIds = await findMissingMemoIds(c.env.DB, results);
+
   return c.json({
-    attachments: results.map(formatAttachment),
+    attachments: results.map((att) =>
+      att.memo_id !== null && missingMemoIds.has(att.memo_id) ? formatAttachment({ ...att, memo_id: null }) : formatAttachment(att),
+    ),
     nextPageToken,
     totalSize: total,
   });

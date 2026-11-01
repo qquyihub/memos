@@ -5,6 +5,7 @@ import * as settingDB from "../db/setting";
 import * as userDB from "../db/user";
 import { getAppVersion } from "../version";
 import { deleteCachedKeys, getCachedJson, putCachedJson } from "../cache";
+import { getUploadPolicy } from "../storage";
 
 type InstApp = { Bindings: Env; Variables: { user: UserPayload } };
 
@@ -97,6 +98,18 @@ instanceRoutes.get("/profile", async (c) => {
 
   await putCachedJson(c.env.CACHE, "instance:profile", response, 600);
   return c.json(response);
+});
+
+// Get the non-sensitive upload policy (naming template and image preprocessing)
+instanceRoutes.get("/upload-config", async (c) => {
+  const cached = await getCachedJson(c.env.CACHE, "instance:upload-config");
+  if (cached) {
+    return c.json(cached);
+  }
+
+  const policy = await getUploadPolicy(c.env.DB);
+  await putCachedJson(c.env.CACHE, "instance:upload-config", policy, 300);
+  return c.json(policy);
 });
 
 // List instance settings
@@ -231,6 +244,7 @@ instanceRoutes.patch("/settings/*", authRequired, async (c) => {
     "instance:profile",
     "instance:settings",
     ...settingCacheKeys,
+    ...(key === "STORAGE" ? ["instance:upload-config"] : []),
   ]);
   return c.json({ name, value: body.value });
 });
