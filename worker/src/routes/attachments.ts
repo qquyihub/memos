@@ -4,7 +4,7 @@ import { authOptional, authRequired } from "../middleware/auth";
 import * as settingDB from "../db/setting";
 import { createErrorBody } from "../error";
 import { deleteCachedKeys } from "../cache";
-import { createStorageBackend, getStorageConfig, normalizeStorageType, type ObjectStorage, type StorageType } from "../storage";
+import { createStorageBackend, deleteStoredObjects, getStorageConfig } from "../storage";
 
 type AttApp = { Bindings: Env; Variables: { user: UserPayload } };
 
@@ -124,19 +124,23 @@ async function findAttachmentsByTokens(db: D1Database, tokens: string[]): Promis
   return [...attachmentsById.values()];
 }
 
-async function deleteStoredObjects(env: Env, db: D1Database, attachments: AttachmentRow[]) {
-  const config = await getStorageConfig(db);
-  const backends = new Map<StorageType, ObjectStorage>();
-  for (const attachment of attachments) {
-    if (!attachment.reference) continue;
-    const type = normalizeStorageType(attachment.storage_type);
-    let backend = backends.get(type);
-    if (!backend) {
-      backend = createStorageBackend(env, config, type);
-      backends.set(type, backend);
-    }
-    await backend.delete(attachment.reference);
+async function findMissingMemoIds(db: D1Database, attachments: AttachmentRow[]): Promise<Set<number>> {
+  const referencedIds = [...new Set(attachments.map((att) => att.memo_id).filter((id): id is number => typeof id === "number" && id > 0))];
+  if (referencedIds.length === 0) {
+    return new Set();
   }
+
+  const existingIds = new Set<number>();
+  for (const chunk of chunkValues(referencedIds, 900)) {
+    const { results } = await db.prepare(
+      `SELECT id FROM memo WHERE id IN (${createPlaceholders(chunk.length)})`
+    ).bind(...chunk).all<{ id: number }>();
+    for (const row of results) {
+      existingIds.add(row.id);
+    }
+  }
+
+  return new Set(referencedIds.filter((id) => !existingIds.has(id)));
 }
 
 async function getAttachmentReadDeniedStatus(db: D1Database, att: AttachmentRow, user: UserPayload | undefined): Promise<401 | 403 | undefined> {
@@ -266,7 +270,7 @@ attachmentRoutes.get("/", authRequired, async (c) => {
   const params: (string | number | null)[] = [user.id];
 
   if (filter.includes("memo_id == null") || filter.includes("memo == null")) {
-    whereConditions.push("memo_id IS NULL");
+    whereConditions.push("(memo_id IS NULL OR memo_id NOT IN (SELECT id FROM memo))");
   }
 
   const whereClause = `WHERE ${whereConditions.join(" AND ")}`;
@@ -282,8 +286,12 @@ attachmentRoutes.get("/", authRequired, async (c) => {
 
   const nextPageToken = offset + pageSize < total ? btoa(String(offset + pageSize)) : "";
 
+  const missingMemoIds = await findMissingMemoIds(c.env.DB, results);
+
   return c.json({
-    attachments: results.map(formatAttachment),
+    attachments: results.map((att) =>
+      att.memo_id !== null && missingMemoIds.has(att.memo_id) ? formatAttachment({ ...att, memo_id: null }) : formatAttachment(att),
+    ),
     nextPageToken,
     totalSize: total,
   });

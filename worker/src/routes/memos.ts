@@ -8,6 +8,7 @@ import * as shareDB from "../db/share";
 import * as settingDB from "../db/setting";
 import { createErrorBody } from "../error";
 import { deleteCachedKeys, getCachedJson, putCachedJson, sha256Hex } from "../cache";
+import { deleteStoredObjects } from "../storage";
 import { buildMemoFilterWhere, MemoFilterError } from "../filter/memo-filter";
 import { deliverMemoWebhookEvent, getWebhookActor, type MemoWebhookEventType } from "../webhook";
 
@@ -812,6 +813,15 @@ memoRoutes.delete("/:id", authRequired, async (c) => {
 
   const creatorName = memo.creator_id === user.id ? user.username : (await c.env.DB.prepare("SELECT username FROM user WHERE id = ?").bind(memo.creator_id).first<{ username: string }>())?.username;
   const deletedMemo = await enrichMemo(c.env.DB, memo, creatorName, user);
+
+  const { results: memoAttachments } = await c.env.DB.prepare(
+    "SELECT id, reference, storage_type FROM attachment WHERE memo_id = ?"
+  ).bind(memo.id).all<{ id: number; reference: string; storage_type: string }>();
+  if (memoAttachments.length > 0) {
+    await deleteStoredObjects(c.env, c.env.DB, memoAttachments);
+    await c.env.DB.prepare("DELETE FROM attachment WHERE memo_id = ?").bind(memo.id).run();
+  }
+
   await memoDB.deleteMemo(c.env.DB, memo.id);
   await invalidateMemoDerivedCaches(c.env.CACHE, [creatorName]);
   enqueueMemoWebhook(c, "memo.deleted", memo.creator_id, deletedMemo, user);

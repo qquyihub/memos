@@ -81,6 +81,38 @@ const requireWebDAVConfig = (config?: WebDAVStorageConfig): WebDAVStorageConfig 
   return config;
 };
 
+export interface StoredObjectDeletionTarget {
+  reference: string;
+  storage_type: string;
+}
+
+/**
+ * Deletes stored objects for the given attachments. Failures are logged but never
+ * thrown so that database cleanup (attachment rows, memos) can always proceed.
+ */
+export async function deleteStoredObjects(env: Env, db: D1Database, attachments: StoredObjectDeletionTarget[]): Promise<void> {
+  const backends = new Map<StorageType, ObjectStorage>();
+  let config: StorageConfig | null = null;
+
+  for (const attachment of attachments) {
+    if (!attachment.reference) {
+      continue;
+    }
+    const type = normalizeStorageType(attachment.storage_type);
+    try {
+      let backend = backends.get(type);
+      if (!backend) {
+        config ??= await getStorageConfig(db);
+        backend = createStorageBackend(env, config, type);
+        backends.set(type, backend);
+      }
+      await backend.delete(attachment.reference);
+    } catch (error) {
+      console.warn(`[storage] Failed to delete object ${attachment.reference} from ${type} storage:`, error);
+    }
+  }
+}
+
 export function createStorageBackend(env: Env, config: StorageConfig, typeOverride?: StorageType): ObjectStorage {
   const type = typeOverride ?? config.storageType;
   if (type === "S3") {
