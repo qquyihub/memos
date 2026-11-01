@@ -14,7 +14,7 @@ APP_VERSION = "1.0.0"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "memos"
+database_name = "cfmemos-db"
 database_id = "e21c28f3-b96d-42e5-ab10-cc56d85b122f"
 
 [[r2_buckets]]
