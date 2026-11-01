@@ -57,8 +57,10 @@ const BOOLEAN_FIELD_SQL: Record<string, string> = {
   has_link: "COALESCE(json_extract(memo.payload, '$.property.hasLink'), 0)",
   has_task_list: "COALESCE(json_extract(memo.payload, '$.property.hasTaskList'), 0)",
   has_code: "COALESCE(json_extract(memo.payload, '$.property.hasCode'), 0)",
-  has_incomplete_task: "COALESCE(json_extract(memo.payload, '$.property.hasIncompleteTask'), 0)",
-  has_incomplete_tasks: "COALESCE(json_extract(memo.payload, '$.property.hasIncompleteTask'), 0)",
+  has_incomplete_task:
+    "COALESCE(json_extract(memo.payload, '$.property.hasIncompleteTasks'), json_extract(memo.payload, '$.property.hasIncompleteTask'), 0)",
+  has_incomplete_tasks:
+    "COALESCE(json_extract(memo.payload, '$.property.hasIncompleteTasks'), json_extract(memo.payload, '$.property.hasIncompleteTask'), 0)",
 };
 
 const SCALAR_FIELD_SQL: Record<string, string> = {

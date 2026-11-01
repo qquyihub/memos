@@ -112,22 +112,12 @@ export function serializeIdentityProvider(
 
   return {
     name: buildIdentityProviderName(row.uid),
+    type: "OAUTH2",
     title: row.name || row.uid,
-    type: normalizeIdentityProviderTypeEnum(row.type),
     identifierFilter: row.identifier_filter || "",
-    config: hasStoredOAuth2Config(oauth2Config)
-      ? {
-          config: {
-            case: "oauth2Config" as const,
-            value: serializedOAuth2Config,
-          },
-        }
-      : {
-          config: {
-            case: undefined,
-            value: undefined,
-          },
-        },
+    config: {
+      oauth2Config: serializedOAuth2Config,
+    },
   };
 }
 
@@ -140,6 +130,9 @@ function unwrapStoredOAuth2Config(value: unknown): Record<string, any> | undefin
 
   if (parsedRecord.config && typeof parsedRecord.config === "object") {
     const oneof = parsedRecord.config as Record<string, any>;
+    if (oneof.oauth2Config && typeof oneof.oauth2Config === "object") {
+      return oneof.oauth2Config as Record<string, any>;
+    }
     if (oneof.case === "oauth2Config" && oneof.value && typeof oneof.value === "object") {
       return oneof.value as Record<string, any>;
     }

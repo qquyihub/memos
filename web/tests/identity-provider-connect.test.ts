@@ -123,24 +123,30 @@ describe("identityProviderServiceClient", () => {
       },
     });
 
-    const [, request] = fetchMock.mock.calls[0];
+    const [url, request] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain("/api/v1/identity-providers");
+    expect(String(url)).toContain("identityProviderId=github");
     expect(request?.method).toBe("POST");
     expect(typeof request?.body).toBe("string");
 
     const body = JSON.parse(String(request?.body));
-    expect(body.identityProviderId).toBe("github");
+    expect(body.title).toBe("GitHub");
+    expect(body.type).toBe("OAUTH2");
+    expect(body.identifierFilter).toBe("");
     expect(body.config).toEqual({
-      clientId: "client",
-      clientSecret: "secret",
-      authUrl: "https://github.com/login/oauth/authorize",
-      tokenUrl: "https://github.com/login/oauth/access_token",
-      userInfoUrl: "https://api.github.com/user",
-      scopes: ["read:user"],
-      fieldMapping: {
-        identifier: "login",
-        displayName: "name",
-        email: "email",
-        avatarUrl: "",
+      oauth2Config: {
+        clientId: "client",
+        clientSecret: "secret",
+        authUrl: "https://github.com/login/oauth/authorize",
+        tokenUrl: "https://github.com/login/oauth/access_token",
+        userInfoUrl: "https://api.github.com/user",
+        scopes: ["read:user"],
+        fieldMapping: {
+          identifier: "login",
+          displayName: "name",
+          email: "email",
+          avatarUrl: "",
+        },
       },
     });
   });

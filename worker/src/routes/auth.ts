@@ -66,28 +66,33 @@ async function buildCurrentUserResponse(db: D1Database, userId: number) {
     return null;
   }
 
-  const formattedUser = formatUser(user, { includeEmail: true });
   return {
-    user: formattedUser,
-    ...formattedUser,
+    user: formatUser(user, { includeEmail: true }),
   };
 }
 
 authRoutes.post("/signin", async (c) => {
   const body = await c.req.json();
 
+  const ssoCredentials: any =
+    body.ssoCredentials ??
+    body.sso_credentials ??
+    (body.credentials?.case === "ssoCredentials" ? body.credentials.value : undefined);
+
   let user: Awaited<ReturnType<typeof findUserByUsername>>;
 
-  if (body.credentials?.case === "ssoCredentials") {
-    const { idpName, code, redirectUri, codeVerifier } = body.credentials.value;
-    const idpUid = extractIdentityProviderUid(idpName);
+  if (ssoCredentials) {
+    const { idpName, idp_name, code, redirectUri, redirect_uri, codeVerifier, code_verifier } = ssoCredentials;
+    const idpUid = extractIdentityProviderUid(idpName ?? idp_name);
+    const effectiveRedirectUri = redirectUri ?? redirect_uri;
+    const effectiveCodeVerifier = codeVerifier ?? code_verifier;
     if (!idpUid || !code) {
       return c.json({ error: "Missing IDP name or authorization code" }, 400);
     }
 
     let oauthUser;
     try {
-      oauthUser = await exchangeOAuthCode(c.env.DB, idpUid, code, redirectUri, codeVerifier);
+      oauthUser = await exchangeOAuthCode(c.env.DB, idpUid, code, effectiveRedirectUri, effectiveCodeVerifier);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to authenticate with identity provider";
       console.error("Failed to exchange OAuth code during sign-in:", error);
@@ -145,16 +150,14 @@ authRoutes.post("/signin", async (c) => {
       return c.json({ error: "Failed to find or create user" }, 500);
     }
   } else {
-    let username: string;
-    let password: string;
+    const passwordCredentials: any =
+      body.passwordCredentials ??
+      body.password_credentials ??
+      body.credentials?.value ??
+      body;
 
-    if (body.credentials?.value) {
-      username = body.credentials.value.username;
-      password = body.credentials.value.password;
-    } else {
-      username = body.username;
-      password = body.password;
-    }
+    const username: string = passwordCredentials?.username;
+    const password: string = passwordCredentials?.password;
 
     if (!username || !password) {
       return c.json({ error: "Username and password required" }, 400);
@@ -202,10 +205,7 @@ authRoutes.post("/signin", async (c) => {
   return c.json({
     user: formattedUser,
     accessToken,
-    expiresAt: toISODateTime(expiresAt),
-    expiresAtSeconds: expiresAt,
     accessTokenExpiresAt: toISODateTime(expiresAt),
-    ...formattedUser,
   });
 });
 
@@ -261,10 +261,7 @@ authRoutes.post("/signup", async (c) => {
   return c.json({
     user: formattedUser,
     accessToken,
-    expiresAt: toISODateTime(expiresAt),
-    expiresAtSeconds: expiresAt,
     accessTokenExpiresAt: toISODateTime(expiresAt),
-    ...formattedUser,
   });
 });
 
@@ -299,8 +296,6 @@ authRoutes.post("/refresh", async (c) => {
     return c.json({
       accessToken,
       expiresAt: toISODateTime(expiresAt),
-      expiresAtSeconds: expiresAt,
-      accessTokenExpiresAt: toISODateTime(expiresAt),
     });
   } catch {
     clearSessionCookies(c);

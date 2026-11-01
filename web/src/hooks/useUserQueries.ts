@@ -49,12 +49,18 @@ export function useUserStats(username?: string) {
 }
 
 export function useShortcuts() {
+  const currentUser = useCurrentUser();
+
   return useQuery({
     queryKey: userKeys.shortcuts(),
     queryFn: async () => {
-      const { shortcuts } = await shortcutServiceClient.listShortcuts({});
+      if (!currentUser?.name) {
+        return [];
+      }
+      const { shortcuts } = await shortcutServiceClient.listShortcuts({ parent: currentUser.name });
       return shortcuts;
     },
+    enabled: !!currentUser?.name,
   });
 }
 

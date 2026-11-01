@@ -33,21 +33,21 @@ export interface AttachmentRow {
 
 const nowTs = () => Math.floor(Date.now() / 1000);
 
-function formatAttachment(att: AttachmentRow) {
+function formatAttachment(att: AttachmentRow, memoUid?: string | null) {
   return {
-    id: att.id,
     name: `attachments/${att.uid}`,
-    uid: att.uid,
-    creatorId: att.creator_id,
     createTime: new Date(att.created_ts * 1000).toISOString(),
-    updateTime: new Date(att.updated_ts * 1000).toISOString(),
     filename: att.filename,
     type: att.type,
-    size: att.size,
-    memoId: att.memo_id,
-    storageType: att.storage_type,
-    reference: att.reference,
+    size: String(att.size),
+    ...(memoUid ? { memo: `memos/${memoUid}` } : {}),
   };
+}
+
+async function findMemoUidById(db: D1Database, memoId: number | null): Promise<string | null> {
+  if (!memoId) return null;
+  const row = await db.prepare("SELECT uid FROM memo WHERE id = ?").bind(memoId).first<{ uid: string }>();
+  return row?.uid ?? null;
 }
 
 function decodeBase64Content(content: string): ArrayBuffer {
@@ -130,23 +130,23 @@ async function findAttachmentsByTokens(db: D1Database, tokens: string[]): Promis
   return [...attachmentsById.values()];
 }
 
-async function findMissingMemoIds(db: D1Database, attachments: AttachmentRow[]): Promise<Set<number>> {
+async function findMemoUids(db: D1Database, attachments: AttachmentRow[]): Promise<Map<number, string>> {
   const referencedIds = [...new Set(attachments.map((att) => att.memo_id).filter((id): id is number => typeof id === "number" && id > 0))];
+  const memoUids = new Map<number, string>();
   if (referencedIds.length === 0) {
-    return new Set();
+    return memoUids;
   }
 
-  const existingIds = new Set<number>();
   for (const chunk of chunkValues(referencedIds, 900)) {
     const { results } = await db.prepare(
-      `SELECT id FROM memo WHERE id IN (${createPlaceholders(chunk.length)})`
-    ).bind(...chunk).all<{ id: number }>();
+      `SELECT id, uid FROM memo WHERE id IN (${createPlaceholders(chunk.length)})`
+    ).bind(...chunk).all<{ id: number; uid: string }>();
     for (const row of results) {
-      existingIds.add(row.id);
+      memoUids.set(row.id, row.uid);
     }
   }
 
-  return new Set(referencedIds.filter((id) => !existingIds.has(id)));
+  return memoUids;
 }
 
 async function getAttachmentReadDeniedStatus(db: D1Database, att: AttachmentRow, user: UserPayload | undefined): Promise<401 | 403 | undefined> {
@@ -269,7 +269,7 @@ attachmentRoutes.post("/", authRequired, async (c) => {
     }
   }
 
-  const uid = crypto.randomUUID().replace(/-/g, "").slice(0, 22);
+  const uid = c.req.query("attachmentId") || c.req.query("attachment_id") || crypto.randomUUID().replace(/-/g, "").slice(0, 22);
   const createdTs = nowTs();
   const objectKey = await buildUniqueObjectKey(c.env.DB, uploadPolicy, {
     username: user.username,
@@ -292,7 +292,7 @@ attachmentRoutes.post("/", authRequired, async (c) => {
     .first<AttachmentRow>();
 
   await deleteCachedKeys(c.env.CACHE, ["instance:stats"]);
-  return c.json(formatAttachment(att!), 201);
+  return c.json(formatAttachment(att!, await findMemoUidById(c.env.DB, att!.memo_id)));
 });
 
 // List attachments
@@ -326,11 +326,11 @@ attachmentRoutes.get("/", authRequired, async (c) => {
 
   const nextPageToken = offset + pageSize < total ? btoa(String(offset + pageSize)) : "";
 
-  const missingMemoIds = await findMissingMemoIds(c.env.DB, results);
+  const memoUids = await findMemoUids(c.env.DB, results);
 
   return c.json({
     attachments: results.map((att) =>
-      att.memo_id !== null && missingMemoIds.has(att.memo_id) ? formatAttachment({ ...att, memo_id: null }) : formatAttachment(att),
+      formatAttachment(att, att.memo_id !== null ? memoUids.get(att.memo_id) : null)
     ),
     nextPageToken,
     totalSize: total,
@@ -345,13 +345,14 @@ attachmentRoutes.get("/:id", authOptional, async (c) => {
   if (deniedStatus) {
     return c.json({ error: deniedStatus === 401 ? "Authentication required" : "Permission denied" }, deniedStatus);
   }
-  return c.json(formatAttachment(att));
+  return c.json(formatAttachment(att, await findMemoUidById(c.env.DB, att.memo_id)));
 });
 
 // Update attachment
 attachmentRoutes.patch("/:id", authRequired, async (c) => {
   const user = c.get("user");
-  const body = await c.req.json<{ filename?: string; memoId?: number | null; memo?: string | null }>();
+  const body = await c.req.json<{ attachment?: { filename?: string; memoId?: number | null; memo?: string | null }; filename?: string; memoId?: number | null; memo?: string | null }>();
+  const attachmentInput = body.attachment ?? body;
 
   const att = await findAttachmentByToken(c.env.DB, c.req.param("id"));
   if (!att) return c.json({ error: "Not found" }, 404);
@@ -362,9 +363,9 @@ attachmentRoutes.patch("/:id", authRequired, async (c) => {
   const updates: string[] = [];
   const params: (string | number | null)[] = [];
 
-  if (body.filename !== undefined) { updates.push("filename = ?"); params.push(body.filename); }
-  if (body.memoId !== undefined || body.memo !== undefined) {
-    const resolvedMemo = await resolveWritableMemoId(c.env.DB, user, body.memo ?? body.memoId ?? null);
+  if (attachmentInput.filename !== undefined) { updates.push("filename = ?"); params.push(attachmentInput.filename); }
+  if (attachmentInput.memoId !== undefined || attachmentInput.memo !== undefined) {
+    const resolvedMemo = await resolveWritableMemoId(c.env.DB, user, attachmentInput.memo ?? attachmentInput.memoId ?? null);
     if ("error" in resolvedMemo) return c.json({ error: resolvedMemo.error }, resolvedMemo.status);
     updates.push("memo_id = ?");
     params.push(resolvedMemo.memoId);
@@ -379,7 +380,7 @@ attachmentRoutes.patch("/:id", authRequired, async (c) => {
 
   const updated = await c.env.DB.prepare("SELECT * FROM attachment WHERE id = ?")
     .bind(att.id).first<AttachmentRow>();
-  return c.json(formatAttachment(updated!));
+  return c.json(formatAttachment(updated!, await findMemoUidById(c.env.DB, updated!.memo_id)));
 });
 
 // Delete attachment
@@ -400,10 +401,9 @@ attachmentRoutes.delete("/:id", authRequired, async (c) => {
 });
 
 // Batch delete
-attachmentRoutes.post("/:action", authRequired, async (c) => {
-  const action = c.req.param("action");
-  if (action !== "batchDelete") return c.notFound();
+export const attachmentActionRoutes = new Hono<AttApp>();
 
+attachmentActionRoutes.post("/attachments\\:batchDelete", authRequired, async (c) => {
   const user = c.get("user");
   const body = await c.req.json<{ ids?: Array<number | string>; names?: string[] }>();
 

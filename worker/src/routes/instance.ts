@@ -6,6 +6,7 @@ import * as userDB from "../db/user";
 import { getAppVersion } from "../version";
 import { deleteCachedKeys, getCachedJson, putCachedJson } from "../cache";
 import { getUploadPolicy } from "../storage";
+import { formatUser } from "./users";
 
 type InstApp = { Bindings: Env; Variables: { user: UserPayload } };
 
@@ -15,6 +16,32 @@ const PUBLIC_INSTANCE_SETTING_KEYS = new Set(["GENERAL", "MEMO_RELATED", "TAGS",
 
 function getInstanceSettingKey(name: string): string {
   return settingDB.normalizeInstanceSettingName(name).split("/").pop() || "";
+}
+
+const INSTANCE_SETTING_VALUE_FIELDS: Record<string, string> = {
+  GENERAL: "generalSetting",
+  STORAGE: "storageSetting",
+  MEMO_RELATED: "memoRelatedSetting",
+  TAGS: "tagsSetting",
+  NOTIFICATION: "notificationSetting",
+  AI: "aiSetting",
+};
+
+function parseInstanceSettingObject(value: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function formatInstanceSetting(name: string, rawValue: string) {
+  const field = INSTANCE_SETTING_VALUE_FIELDS[getInstanceSettingKey(name)];
+  return {
+    name,
+    ...(field ? { [field]: parseInstanceSettingObject(rawValue) } : {}),
+  };
 }
 
 function sanitizePublicInstanceSettingValue(name: string, value: string): string {
@@ -55,45 +82,24 @@ instanceRoutes.get("/profile", async (c) => {
   }
 
   const userCount = await userDB.countUsers(c.env.DB);
-  const generalSetting = await settingDB.getInstanceSetting(c.env.DB, "GENERAL");
-  let profile = {};
-  if (generalSetting) {
-    try {
-      profile = JSON.parse(generalSetting.value)?.customProfile || {};
-    } catch {
-      profile = {};
-    }
-  } else {
-    const legacyCustomProfile = await settingDB.getSystemSetting(c.env.DB, "instance_profile");
-    if (legacyCustomProfile) {
-      try {
-        profile = JSON.parse(legacyCustomProfile.value);
-      } catch {
-        profile = {};
-      }
-    }
-  }
+  const instanceUrl = new URL(c.req.url).origin;
 
   let admin = undefined;
   if (userCount > 0) {
     const adminUser = await c.env.DB.prepare(
       "SELECT * FROM user WHERE role = 'ADMIN' ORDER BY created_ts ASC LIMIT 1"
-    ).first<any>();
+    ).first<userDB.UserRow>();
     if (adminUser) {
-      admin = {
-        name: `users/${adminUser.username}`,
-        username: adminUser.username,
-        nickname: adminUser.nickname,
-        role: 2,
-      };
+      admin = formatUser(adminUser, { includeEmail: true });
     }
   }
 
   const response = {
     version: getAppVersion(c.env),
-    mode: "prod",
-    admin,
-    ...profile,
+    demo: false,
+    instanceUrl,
+    ...(admin ? { admin } : {}),
+    commit: "",
   };
 
   await putCachedJson(c.env.CACHE, "instance:profile", response, 600);
@@ -112,28 +118,28 @@ instanceRoutes.get("/upload-config", async (c) => {
   return c.json(policy);
 });
 
-// List instance settings
-instanceRoutes.get("/settings", authRequired, async (c) => {
+// Batch get instance settings
+instanceRoutes.post("/settings\\:batchGet", authOptional, async (c) => {
   const currentUser = c.get("user");
-  if (currentUser.role !== "ADMIN") {
-    return c.json({ error: "Admin only" }, 403);
+  const isAdmin = currentUser?.role === "ADMIN";
+  const body = await c.req.json<{ names?: string[] }>();
+  const settings = [];
+
+  for (const rawName of body.names || []) {
+    const name = settingDB.normalizeInstanceSettingName(rawName);
+    const key = getInstanceSettingKey(name);
+    if (!PUBLIC_INSTANCE_SETTING_KEYS.has(key) && !isAdmin) {
+      continue;
+    }
+    const setting = await settingDB.getInstanceSetting(c.env.DB, name);
+    const rawValue = setting?.value ?? "{}";
+    const value = PUBLIC_INSTANCE_SETTING_KEYS.has(key) && !isAdmin
+      ? sanitizePublicInstanceSettingValue(key, rawValue)
+      : rawValue;
+    settings.push(formatInstanceSetting(name, value));
   }
 
-  const cached = await getCachedJson(c.env.CACHE, "instance:settings");
-  if (cached) {
-    return c.json(cached);
-  }
-
-  const settings = await settingDB.listSystemSettings(c.env.DB);
-  const response = {
-    settings: settings.map((setting) => ({
-      ...setting,
-      name: settingDB.normalizeInstanceSettingName(setting.name),
-    })),
-  };
-
-  await putCachedJson(c.env.CACHE, "instance:settings", response, 300);
-  return c.json(response);
+  return c.json({ settings });
 });
 
 // Get instance setting
@@ -154,15 +160,11 @@ instanceRoutes.get("/settings/*", authOptional, async (c) => {
   }
 
   const setting = await settingDB.getInstanceSetting(c.env.DB, name);
-  if (!setting) {
-    const response = { name, value: "{}" };
-    await putCachedJson(c.env.CACHE, cacheKey, response, 300);
-    return c.json(response);
-  }
-  const response = {
-    name: setting.name,
-    value: PUBLIC_INSTANCE_SETTING_KEYS.has(key) && !isAdmin ? sanitizePublicInstanceSettingValue(key, setting.value) : setting.value,
-  };
+  const rawValue = setting?.value ?? "{}";
+  const value = PUBLIC_INSTANCE_SETTING_KEYS.has(key) && !isAdmin
+    ? sanitizePublicInstanceSettingValue(key, rawValue)
+    : rawValue;
+  const response = formatInstanceSetting(name, value);
   await putCachedJson(c.env.CACHE, cacheKey, response, 300);
   return c.json(response);
 });
@@ -234,19 +236,25 @@ instanceRoutes.patch("/settings/*", authRequired, async (c) => {
   const fullPath = c.req.path;
   const name = settingDB.normalizeInstanceSettingName(fullPath.replace("/api/v1/instance/settings/", ""));
   const key = getInstanceSettingKey(name);
-  const body = await c.req.json<{ value: string; description?: string }>();
-  await settingDB.setSystemSetting(c.env.DB, name, body.value, body.description);
+  const body = await c.req.json<Record<string, any>>();
+  const settingInput = body.setting ?? body;
+  const field = INSTANCE_SETTING_VALUE_FIELDS[key];
+  const innerValue = (field && settingInput[field] !== undefined)
+    ? settingInput[field]
+    : (settingInput.value ?? {});
+  const valueStr = typeof innerValue === "string" ? innerValue : JSON.stringify(innerValue);
+
+  await settingDB.setSystemSetting(c.env.DB, name, valueStr, settingInput.description);
   const settingCacheKeys =
     key === "AI"
       ? [`instance:setting:${name}:admin`, `instance:setting:${name}:public`]
       : [`instance:setting:${name}`];
   await deleteCachedKeys(c.env.CACHE, [
     "instance:profile",
-    "instance:settings",
     ...settingCacheKeys,
     ...(key === "STORAGE" ? ["instance:upload-config"] : []),
   ]);
-  return c.json({ name, value: body.value });
+  return c.json(formatInstanceSetting(name, valueStr));
 });
 
 instanceRoutes.get("/stats", authRequired, async (c) => {
@@ -278,14 +286,11 @@ instanceRoutes.get("/stats", authRequired, async (c) => {
 
   const response = {
     database: {
-      driver: "cloudflare-d1",
-      sizeBytes: databaseSize,
+      driver: "sqlite",
+      sizeBytes: String(databaseSize),
     },
-    localStorageBytes,
-    generatedTime: {
-      seconds: Math.floor(Date.now() / 1000),
-      nanos: 0,
-    },
+    localStorageBytes: String(localStorageBytes),
+    generatedTime: new Date().toISOString(),
   };
 
   await putCachedJson(c.env.CACHE, "instance:stats", response, 60);

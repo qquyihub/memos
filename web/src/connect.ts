@@ -51,7 +51,7 @@ export const memoServiceClient = {
     if (paths.includes("content") || memo.content !== undefined) body.content = memo.content;
     if (paths.includes("visibility") || memo.visibility !== undefined) body.visibility = visibilityToString(memo.visibility);
     if (paths.includes("pinned") || memo.pinned !== undefined) body.pinned = memo.pinned;
-    if (paths.includes("state") || memo.state !== undefined) body.rowStatus = memo.state === 2 ? "ARCHIVED" : "NORMAL";
+    if (paths.includes("state") || memo.state !== undefined) body.state = stateToString(memo.state);
     if (paths.includes("create_time") && memo.createTime) body.createTime = timestampToISO(memo.createTime);
     if (paths.includes("update_time") && memo.updateTime) body.updateTime = timestampToISO(memo.updateTime);
     if (paths.includes("location") || memo.location !== undefined) body.location = memo.location;
@@ -145,16 +145,16 @@ export const memoServiceClient = {
 
   async createMemoShare(req: { parent: string; memoShare?: any }) {
     const id = extractId(req.parent, "memos/");
-    const data = await apiRequest<any>("POST", `/api/v1/memos/${id}/shares`, {
-      expiresTs: req.memoShare?.expireTime ? Math.floor(new Date(timestampToISO(req.memoShare.expireTime)).getTime() / 1000) : undefined,
-    });
+    const body: any = {};
+    if (req.memoShare?.expireTime) body.expireTime = timestampToISO(req.memoShare.expireTime);
+    const data = await apiRequest<any>("POST", `/api/v1/memos/${id}/shares`, body);
     return normalizeShare(data);
   },
 
   async listMemoShares(req: { parent: string }) {
     const id = extractId(req.parent, "memos/");
     const data = await apiRequest<any>("GET", `/api/v1/memos/${id}/shares`);
-    return { memoShares: (data.shares || []).map(normalizeShare) };
+    return { memoShares: (data.memoShares || []).map(normalizeShare) };
   },
 
   async deleteMemoShare(req: { name: string }) {
@@ -165,7 +165,7 @@ export const memoServiceClient = {
   },
 
   async getMemoByShare(req: { shareId: string }) {
-    const data = await apiRequest<any>("GET", `/api/v1/memos/shares/${req.shareId}`);
+    const data = await apiRequest<any>("GET", `/api/v1/shares/${req.shareId}`);
     return normalizeMemo(data);
   },
 
@@ -187,14 +187,14 @@ export const memoServiceClient = {
 export const authServiceClient = {
   async getCurrentUser(_req?: any) {
     const data = await apiRequest<any>("GET", "/api/v1/auth/me");
-    return { user: normalizeUser(data) };
+    return { user: normalizeUser(data.user ?? data) };
   },
 
   async signIn(req: { username?: string; password?: string; credentials?: any; neverExpire?: boolean }) {
     let body: any;
 
     if (req.credentials?.case === "ssoCredentials") {
-      body = { credentials: req.credentials };
+      body = { ssoCredentials: req.credentials.value };
     } else {
       let username = req.username;
       let password = req.password;
@@ -202,13 +202,13 @@ export const authServiceClient = {
         username = req.credentials.value.username;
         password = req.credentials.value.password;
       }
-      body = { username, password };
+      body = { passwordCredentials: { username, password } };
     }
 
     const data = await apiRequest<any>("POST", "/api/v1/auth/signin", body);
     return {
       accessToken: data.accessToken,
-      accessTokenExpiresAt: data.expiresAt ? { seconds: data.expiresAt, nanos: 0 } : undefined,
+      accessTokenExpiresAt: data.accessTokenExpiresAt ? isoToTimestamp(data.accessTokenExpiresAt) : undefined,
       user: data.user ? normalizeUser(data.user) : undefined,
     };
   },
@@ -221,7 +221,7 @@ export const authServiceClient = {
     const data = await apiRequest<any>("POST", "/api/v1/auth/refresh");
     return {
       accessToken: data.accessToken,
-      accessTokenExpiresAt: data.expiresAt ? { seconds: data.expiresAt, nanos: 0 } : undefined,
+      expiresAt: data.expiresAt ? isoToTimestamp(data.expiresAt) : undefined,
     };
   },
 
@@ -232,7 +232,7 @@ export const authServiceClient = {
     });
     return {
       accessToken: data.accessToken,
-      expiresAt: data.expiresAt ? { seconds: data.expiresAt } : undefined,
+      accessTokenExpiresAt: data.accessTokenExpiresAt ? isoToTimestamp(data.accessTokenExpiresAt) : undefined,
       user: data.user ? normalizeUser(data.user) : undefined,
     };
   },
@@ -249,7 +249,7 @@ export const userServiceClient = {
   },
 
   async batchGetUsers(req: { usernames: string[] }) {
-    const data = await apiRequest<any>("POST", "/api/v1/users/batchGet", { usernames: req.usernames });
+    const data = await apiRequest<any>("POST", "/api/v1/users:batchGet", { usernames: req.usernames });
     return { users: (data.users || []).map(normalizeUser) };
   },
 
@@ -260,14 +260,14 @@ export const userServiceClient = {
   },
 
   async createUser(req: { user: any }) {
-    const data = await apiRequest<any>("POST", "/api/v1/users", req.user);
+    const data = await apiRequest<any>("POST", "/api/v1/users", buildUserPayload(req.user));
     return normalizeUser(data);
   },
 
   async updateUser(req: { user: any; updateMask?: any }) {
     const user = req.user || {};
     const username = extractId(user.name, "users/");
-    const data = await apiRequest<any>("PATCH", `/api/v1/users/${username}`, user);
+    const data = await apiRequest<any>("PATCH", `/api/v1/users/${username}`, buildUserPayload(user));
     return normalizeUser(data);
   },
 
@@ -278,11 +278,12 @@ export const userServiceClient = {
 
   async getUserStats(req: { name: string }) {
     const username = extractId(req.name, "users/");
-    return apiRequest<any>("GET", `/api/v1/users/${username}/stats`);
+    return apiRequest<any>("GET", `/api/v1/users/${username}:getStats`);
   },
 
   async listAllUserStats(_req?: any) {
-    return apiRequest<any>("GET", "/api/v1/users/stats");
+    const data = await apiRequest<any>("GET", "/api/v1/users:stats");
+    return { stats: data.stats || [] };
   },
 
   async getUserSetting(req: { name: string }) {
@@ -290,7 +291,7 @@ export const userServiceClient = {
     const username = parts[1];
     const key = parts[3];
     const data = await apiRequest<any>("GET", `/api/v1/users/${username}/settings/${key}`);
-    return data.setting || { key, value: "" };
+    return normalizeUserSetting(data, req.name);
   },
 
   async updateUserSetting(req: { setting: any; updateMask?: any }) {
@@ -298,33 +299,24 @@ export const userServiceClient = {
     const parts = (setting.name || "").split("/");
     const username = parts[1];
     const key = parts[3] || setting.key;
-    // setting.value is { case: "generalSetting", value: {...} } — send the inner value
-    const innerValue = setting.value?.value !== undefined ? setting.value.value : setting.value;
-    const data = await apiRequest<any>("PATCH", `/api/v1/users/${username}/settings/${key}`, { value: innerValue });
-    return data.setting || setting;
+    const caseName = setting.value?.case;
+    const innerValue = setting.value?.value !== undefined ? setting.value.value : {};
+    const body: any = { name: setting.name };
+    if (caseName) {
+      body[caseName] = innerValue;
+    } else {
+      body.value = innerValue;
+    }
+    const data = await apiRequest<any>("PATCH", `/api/v1/users/${username}/settings/${key}`, body);
+    return normalizeUserSetting(data, setting.name);
   },
 
   async listUserSettings(req: { parent: string }) {
     const username = extractId(req.parent, "users/");
     const data = await apiRequest<any>("GET", `/api/v1/users/${username}/settings`);
-    const settings = (data.settings || []).map((s: any) => {
-      let parsedValue: any;
-      try {
-        parsedValue = typeof s.value === "string" ? JSON.parse(s.value) : s.value;
-      } catch {
-        parsedValue = s.value;
-      }
-      const caseMap: Record<string, string> = {
-        general: "generalSetting",
-        GENERAL: "generalSetting",
-        webhooks: "webhooksSetting",
-        WEBHOOKS: "webhooksSetting",
-        locale: "generalSetting",
-        appearance: "generalSetting",
-      };
-      const caseName = caseMap[s.key] || s.key;
-      return { name: `users/${username}/settings/${s.key}`, key: s.key, value: { case: caseName, value: parsedValue } };
-    });
+    const settings = (data.settings || []).map((s: any) =>
+      normalizeUserSetting(s, `users/${username}/settings/${s.key ?? ""}`),
+    );
     return { settings };
   },
 
@@ -344,9 +336,15 @@ export const userServiceClient = {
     const username = extractId(req.parent, "users/");
     const body = req.personalAccessToken || { description: req.description, expiresInDays: req.expiresInDays };
     const data = await apiRequest<any>("POST", `/api/v1/users/${username}/personalAccessTokens`, body);
+    const token = data.personalAccessToken;
     return {
       token: data.token,
-      personalAccessToken: { description: data.description || body.description || "" },
+      personalAccessToken: {
+        ...(token || {}),
+        description: token?.description || body.description || "",
+        createdAt: token?.createdAt ? isoToTimestamp(token.createdAt) : undefined,
+        expiresAt: token?.expiresAt ? isoToTimestamp(token.expiresAt) : undefined,
+      },
     };
   },
 
@@ -360,7 +358,8 @@ export const userServiceClient = {
   async listUserNotifications(req: { parent: string }) {
     const username = extractId(req.parent, "users/");
     const data = await apiRequest<any>("GET", `/api/v1/users/${username}/notifications`);
-    return { notifications: data.notifications || [] };
+    const notifications = (data.notifications || []).map(normalizeUserNotification);
+    return { notifications, nextPageToken: data.nextPageToken || "" };
   },
 
   async updateUserNotification(req: { notification: any; updateMask?: any }) {
@@ -368,7 +367,12 @@ export const userServiceClient = {
     const parts = (notif.name || "").split("/");
     const username = parts[1];
     const notifId = parts[3];
-    return apiRequest<any>("PATCH", `/api/v1/users/${username}/notifications/${notifId}`, notif);
+    const status = typeof notif.status === "number" ? (notif.status === 2 ? "ARCHIVED" : "UNREAD") : notif.status;
+    const data = await apiRequest<any>("PATCH", `/api/v1/users/${username}/notifications/${notifId}`, {
+      name: notif.name,
+      status,
+    });
+    return normalizeUserNotification(data);
   },
 
   async deleteUserNotification(req: { name: string }) {
@@ -485,7 +489,7 @@ export const attachmentServiceClient = {
   },
 
   async batchDeleteAttachments(req: { names: string[] }) {
-    await apiRequest<any>("POST", "/api/v1/attachments/batchDelete", { names: req.names || [] });
+    await apiRequest<any>("POST", "/api/v1/attachments:batchDelete", { names: req.names || [] });
   },
 };
 
@@ -505,55 +509,40 @@ export const instanceServiceClient = {
   async getInstanceSetting(req: { name: string }) {
     const name = req.name; // e.g. "instance/settings/GENERAL"
     const data = await apiRequest<any>("GET", `/api/v1/${name}`);
-    try {
-      const parsed = typeof data.value === "string" ? JSON.parse(data.value) : (data.value || {});
-      const keyName = name.split("/").pop() || "";
-      const caseMap: Record<string, string> = {
-        GENERAL: "generalSetting",
-        MEMO_RELATED: "memoRelatedSetting",
-        STORAGE: "storageSetting",
-        TAGS: "tagsSetting",
-        NOTIFICATION: "notificationSetting",
-        AI: "aiSetting",
-      };
-      const caseName = caseMap[keyName] || "generalSetting";
-      return { name: data.name || name, value: { case: caseName, value: parsed } };
-    } catch {
-      return { name: data.name || name, value: { case: undefined, value: {} } };
-    }
+    return normalizeInstanceSetting(data, name);
   },
 
   async updateInstanceSetting(req: { setting: any; updateMask?: any }) {
     const setting = req.setting || {};
     const name = setting.name; // e.g. "instance/settings/GENERAL"
-    const innerValue = setting.value?.value ?? setting.value ?? {};
-    await apiRequest<any>("PATCH", `/api/v1/${name}`, {
-      value: JSON.stringify(innerValue),
-    });
-    const keyName = name.split("/").pop() || "";
-    const caseMap: Record<string, string> = {
-      GENERAL: "generalSetting",
-      MEMO_RELATED: "memoRelatedSetting",
-      STORAGE: "storageSetting",
-      TAGS: "tagsSetting",
-      NOTIFICATION: "notificationSetting",
-      AI: "aiSetting",
-    };
-    return {
-      name,
-      value: {
-        case: caseMap[keyName] || setting.value?.case,
-        value: innerValue,
-      },
-    };
+    const caseName = setting.value?.case;
+    const innerValue = setting.value?.value ?? {};
+    const body: any = { name };
+    if (caseName) {
+      body[caseName] = innerValue;
+    } else {
+      body.value = innerValue;
+    }
+    const data = await apiRequest<any>("PATCH", `/api/v1/${name}`, body);
+    return normalizeInstanceSetting(data, name);
   },
 
-  async listInstanceSettings(_req?: any) {
-    return apiRequest<any>("GET", "/api/v1/instance/settings");
+  async listInstanceSettings(req?: { names?: string[] }) {
+    const data = await apiRequest<any>("POST", "/api/v1/instance/settings:batchGet", { names: req?.names || [] });
+    return { settings: (data.settings || []).map((s: any) => normalizeInstanceSetting(s, s.name)) };
   },
 
   async getInstanceStats(_req?: any) {
-    return apiRequest<any>("GET", "/api/v1/instance/stats").catch(() => ({}));
+    const data = await apiRequest<any>("GET", "/api/v1/instance/stats").catch(() => ({}));
+    if (!data || !data.database) return data;
+    return {
+      database: {
+        driver: data.database.driver || "",
+        sizeBytes: toBigInt(data.database.sizeBytes),
+      },
+      localStorageBytes: toBigInt(data.localStorageBytes),
+      generatedTime: data.generatedTime ? isoToTimestamp(data.generatedTime) : undefined,
+    };
   },
 
   async testInstanceEmailSetting(req: { email?: any; recipientEmail?: string }) {
@@ -574,15 +563,15 @@ export const aiServiceClient = {
     const audio = req.audio;
     if (!audio) return { text: "" };
 
-    const formData = new FormData();
+    const body: any = { audio: {} };
     if (audio.source?.case === "content" && audio.source.value) {
-      const blob = new Blob([audio.source.value], { type: audio.contentType || "audio/wav" });
-      formData.append("file", blob, audio.filename || "audio.wav");
+      body.audio.content = bytesToBase64(audio.source.value);
     }
-    if (audio.contentType) formData.append("contentType", audio.contentType);
-    if (req.language) formData.append("language", req.language);
+    if (audio.filename) body.audio.filename = audio.filename;
+    if (audio.contentType) body.audio.contentType = audio.contentType;
+    if (req.language) body.language = req.language;
 
-    const data = await apiRequest<any>("POST", "/api/v1/ai/transcribe", formData, { isFormData: true });
+    const data = await apiRequest<any>("POST", "/api/v1/ai:transcribe", body);
     return { text: data.text || "" };
   },
 };
@@ -592,23 +581,41 @@ export const aiServiceClient = {
 // ============================================================================
 
 export const shortcutServiceClient = {
-  async listShortcuts(_req?: any) {
-    return apiRequest<any>("GET", "/api/v1/shortcuts").catch(() => ({ shortcuts: [] }));
+  async listShortcuts(req?: { parent?: string }) {
+    const username = extractId(req?.parent || "", "users/");
+    if (!username) return { shortcuts: [] };
+    const data = await apiRequest<any>("GET", `/api/v1/users/${username}/shortcuts`).catch(() => ({ shortcuts: [] }));
+    return { shortcuts: (data.shortcuts || []).map(normalizeShortcut) };
   },
 
   async createShortcut(req: { shortcut: any; parent?: string }) {
-    return apiRequest<any>("POST", "/api/v1/shortcuts", req.shortcut);
+    const username = extractId(req.parent || "", "users/");
+    const shortcut = req.shortcut || {};
+    const data = await apiRequest<any>("POST", `/api/v1/users/${username}/shortcuts`, {
+      title: shortcut.title || "",
+      filter: shortcut.filter || "",
+    });
+    return normalizeShortcut(data);
   },
 
   async updateShortcut(req: { shortcut: any; updateMask?: any }) {
     const shortcut = req.shortcut || {};
-    const id = extractId(shortcut.name, "shortcuts/");
-    return apiRequest<any>("PATCH", `/api/v1/shortcuts/${id}`, shortcut);
+    const parts = (shortcut.name || "").split("/");
+    const username = parts[1];
+    const id = parts[3];
+    const data = await apiRequest<any>("PATCH", `/api/v1/users/${username}/shortcuts/${id}`, {
+      name: shortcut.name,
+      title: shortcut.title,
+      filter: shortcut.filter,
+    });
+    return normalizeShortcut(data);
   },
 
   async deleteShortcut(req: { name: string }) {
-    const id = extractId(req.name, "shortcuts/");
-    await apiRequest<any>("DELETE", `/api/v1/shortcuts/${id}`);
+    const parts = req.name.split("/");
+    const username = parts[1];
+    const id = parts[3];
+    await apiRequest<any>("DELETE", `/api/v1/users/${username}/shortcuts/${id}`);
   },
 };
 
@@ -618,25 +625,30 @@ export const shortcutServiceClient = {
 
 export const identityProviderServiceClient = {
   async listIdentityProviders(_req?: any) {
-    const data = await apiRequest<any>("GET", "/api/v1/idps").catch(() => ({ identityProviders: [] }));
+    const data = await apiRequest<any>("GET", "/api/v1/identity-providers").catch(() => ({ identityProviders: [] }));
     return { identityProviders: (data.identityProviders || []).map(normalizeIdentityProvider) };
   },
 
   async createIdentityProvider(req: { identityProvider: any; identityProviderId?: string }) {
-    const data = await apiRequest<any>("POST", "/api/v1/idps", buildIdentityProviderPayload(req.identityProvider, req.identityProviderId));
+    const query = req.identityProviderId ? buildQueryString({ identityProviderId: req.identityProviderId }) : "";
+    const data = await apiRequest<any>(
+      "POST",
+      `/api/v1/identity-providers${query}`,
+      buildIdentityProviderPayload(req.identityProvider),
+    );
     return normalizeIdentityProvider(data);
   },
 
   async updateIdentityProvider(req: { identityProvider: any; updateMask?: any }) {
     const idp = req.identityProvider || {};
     const id = extractIdentityProviderUid(idp.name || "");
-    const data = await apiRequest<any>("PATCH", `/api/v1/idps/${id}`, buildIdentityProviderPayload(idp));
+    const data = await apiRequest<any>("PATCH", `/api/v1/identity-providers/${id}`, buildIdentityProviderPayload(idp));
     return normalizeIdentityProvider(data);
   },
 
   async deleteIdentityProvider(req: { name: string }) {
     const id = extractIdentityProviderUid(req.name);
-    await apiRequest<any>("DELETE", `/api/v1/idps/${id}`);
+    await apiRequest<any>("DELETE", `/api/v1/identity-providers/${id}`);
   },
 };
 
@@ -695,6 +707,29 @@ function isoToTimestamp(iso: string | undefined): any {
   return { seconds, nanos: 0 };
 }
 
+function toBigInt(value: any): bigint {
+  if (typeof value === "bigint") return value;
+  if (typeof value === "number") return BigInt(Math.trunc(value));
+  if (typeof value === "string" && value.trim() !== "") {
+    try {
+      return BigInt(value);
+    } catch {
+      return BigInt(0);
+    }
+  }
+  return BigInt(0);
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
 function normalizeMemo(data: any): any {
   if (!data) return data;
   const state = data.state ?? data.rowStatus;
@@ -721,15 +756,31 @@ function normalizeMemo(data: any): any {
 
 function normalizeUser(data: any): any {
   if (!data) return data;
+  const rawState = data.state ?? data.rowStatus;
   return {
     ...data,
     name: data.name || `users/${data.username}`,
     displayName: data.displayName ?? data.nickname ?? "",
-    state: data.rowStatus === "ARCHIVED" ? 2 : 1,
+    state: rawState === "ARCHIVED" || rawState === 2 ? 2 : 1,
     createTime: isoToTimestamp(data.createTime),
     updateTime: isoToTimestamp(data.updateTime),
     role: typeof data.role === "string" ? (data.role === "ADMIN" ? 2 : 1) : data.role,
   };
+}
+
+function buildUserPayload(user: any): any {
+  const input = user || {};
+  const body: any = {};
+  for (const key of ["username", "email", "avatarUrl", "description", "nickname", "displayName", "password"]) {
+    if (input[key] !== undefined) body[key] = input[key];
+  }
+  if (input.role !== undefined && input.role !== 0 && input.role !== "") {
+    body.role = typeof input.role === "number" ? (input.role === 2 ? "ADMIN" : "USER") : String(input.role).toUpperCase();
+  }
+  if (input.state !== undefined && input.state !== 0 && input.state !== "") {
+    body.state = typeof input.state === "number" ? (input.state === 2 ? "ARCHIVED" : "NORMAL") : String(input.state).toUpperCase();
+  }
+  return body;
 }
 
 function normalizeAttachment(data: any): any {
@@ -741,6 +792,7 @@ function normalizeAttachment(data: any): any {
     ...data,
     name: data.name || `attachments/${data.id || data.uid}`,
     createTime: isoToTimestamp(data.createTime || data.created_ts),
+    size: toBigInt(data.size),
     memo: memoName,
     externalLink: data.externalLink || data.external_link || "",
     motionMedia: data.motionMedia || data.motion_media,
@@ -770,25 +822,150 @@ function normalizeReaction(r: any): any {
 }
 
 function normalizeShare(s: any): any {
+  if (!s) return s;
   return {
     ...s,
     name: s.name || `memos/${s.memo_id}/shares/${s.uid}`,
-    createTime: s.created_ts ? { seconds: s.created_ts, nanos: 0 } : undefined,
-    expireTime: s.expires_ts ? { seconds: s.expires_ts, nanos: 0 } : undefined,
+    createTime: s.createTime ? isoToTimestamp(s.createTime) : s.created_ts ? { seconds: s.created_ts, nanos: 0 } : undefined,
+    expireTime: s.expireTime ? isoToTimestamp(s.expireTime) : s.expires_ts ? { seconds: s.expires_ts, nanos: 0 } : undefined,
   };
+}
+
+function normalizeShortcut(data: any): any {
+  if (!data) return data;
+  return {
+    ...data,
+    title: data.title || "",
+    filter: data.filter || "",
+  };
+}
+
+function normalizeUserSetting(data: any, fallbackName: string): any {
+  if (!data) {
+    return { name: fallbackName, value: { case: undefined, value: undefined } };
+  }
+  if (data.generalSetting !== undefined) {
+    return { name: data.name || fallbackName, value: { case: "generalSetting", value: data.generalSetting || {} } };
+  }
+  if (data.webhooksSetting !== undefined) {
+    return {
+      name: data.name || fallbackName,
+      value: {
+        case: "webhooksSetting",
+        value: {
+          ...data.webhooksSetting,
+          webhooks: (data.webhooksSetting?.webhooks || []).map(normalizeUserWebhook),
+        },
+      },
+    };
+  }
+  // Legacy shape: { key, value: JSON string }
+  if (data.key !== undefined) {
+    const normalizedKey = String(data.key).toUpperCase();
+    let parsedValue: any = data.value;
+    if (typeof parsedValue === "string") {
+      try {
+        parsedValue = JSON.parse(parsedValue);
+      } catch {
+        parsedValue = {};
+      }
+    }
+    const caseName = normalizedKey === "WEBHOOKS" ? "webhooksSetting" : "generalSetting";
+    const value =
+      caseName === "webhooksSetting"
+        ? { webhooks: (parsedValue?.webhooks || []).map(normalizeUserWebhook) }
+        : parsedValue || {};
+    return { name: data.name || fallbackName, value: { case: caseName, value } };
+  }
+  return { name: data.name || fallbackName, value: data.value || { case: undefined, value: undefined } };
+}
+
+function normalizeUserWebhook(data: any): any {
+  if (!data) return data;
+  return {
+    ...data,
+    createTime: isoToTimestamp(data.createTime),
+    updateTime: isoToTimestamp(data.updateTime),
+  };
+}
+
+function normalizeUserNotification(data: any): any {
+  if (!data) return data;
+  const statusMap: Record<string, number> = { UNREAD: 1, ARCHIVED: 2 };
+  const typeMap: Record<string, number> = { MEMO_COMMENT: 1, MEMO_MENTION: 2 };
+  let payload: any = { case: undefined, value: undefined };
+  if (data.memoComment) {
+    payload = { case: "memoComment", value: data.memoComment };
+  } else if (data.memoMention) {
+    payload = { case: "memoMention", value: data.memoMention };
+  } else if (data.payload?.case) {
+    payload = data.payload;
+  }
+  return {
+    ...data,
+    status: typeof data.status === "string" ? statusMap[data.status] ?? 0 : data.status,
+    type: typeof data.type === "string" ? typeMap[data.type] ?? 0 : data.type,
+    createTime: isoToTimestamp(data.createTime),
+    senderUser: data.senderUser ? normalizeUser(data.senderUser) : undefined,
+    payload,
+  };
+}
+
+function normalizeInstanceSetting(data: any, fallbackName: string): any {
+  if (!data) {
+    return { name: fallbackName, value: { case: undefined, value: undefined } };
+  }
+  const caseMap: Record<string, string> = {
+    generalSetting: "generalSetting",
+    storageSetting: "storageSetting",
+    memoRelatedSetting: "memoRelatedSetting",
+    tagsSetting: "tagsSetting",
+    notificationSetting: "notificationSetting",
+    aiSetting: "aiSetting",
+  };
+  for (const caseName of Object.keys(caseMap)) {
+    if (data[caseName] !== undefined) {
+      return { name: data.name || fallbackName, value: { case: caseName, value: data[caseName] || {} } };
+    }
+  }
+  // Legacy shape: { key, value: JSON string }
+  if (data.value !== undefined) {
+    let parsedValue: any = data.value;
+    if (typeof parsedValue === "string") {
+      try {
+        parsedValue = JSON.parse(parsedValue);
+      } catch {
+        parsedValue = {};
+      }
+    }
+    const keyName = (data.name || fallbackName).split("/").pop() || "";
+    const legacyMap: Record<string, string> = {
+      GENERAL: "generalSetting",
+      MEMO_RELATED: "memoRelatedSetting",
+      STORAGE: "storageSetting",
+      TAGS: "tagsSetting",
+      NOTIFICATION: "notificationSetting",
+      AI: "aiSetting",
+    };
+    return { name: data.name || fallbackName, value: { case: legacyMap[keyName] || "generalSetting", value: parsedValue || {} } };
+  }
+  return { name: data.name || fallbackName, value: { case: undefined, value: undefined } };
 }
 
 const IDENTITY_PROVIDER_NAME_PREFIX = "identity-providers/";
 const LEGACY_IDENTITY_PROVIDER_NAME_PREFIX = "identityProviders/";
 
-function buildIdentityProviderPayload(identityProvider: any, identityProviderId?: string): any {
-  return {
-    identityProviderId: identityProviderId || extractIdentityProviderUid(identityProvider?.name || ""),
+function buildIdentityProviderPayload(identityProvider: any): any {
+  const config = normalizeOAuth2Config(identityProvider?.config);
+  const payload: any = {
     title: identityProvider?.title || "",
-    type: normalizeIdentityProviderTypeForRequest(identityProvider?.type),
+    type: "OAUTH2",
     identifierFilter: identityProvider?.identifierFilter ?? identityProvider?.identifier_filter ?? "",
-    config: normalizeOAuth2Config(identityProvider?.config) || {},
   };
+  if (config) {
+    payload.config = { oauth2Config: config };
+  }
+  return payload;
 }
 
 function normalizeIdentityProvider(data: any): any {
@@ -840,10 +1017,6 @@ function normalizeIdentityProviderType(value: any): number {
     return value;
   }
   return typeof value === "string" && value.toLowerCase() === "oauth2" ? 1 : 0;
-}
-
-function normalizeIdentityProviderTypeForRequest(value: any): string {
-  return normalizeIdentityProviderType(value) === 1 ? "oauth2" : "oauth2";
 }
 
 function normalizeOAuth2Config(value: any): any | undefined {
@@ -918,6 +1091,10 @@ function unwrapOAuth2Config(value: any): any {
   const parsed = parsePossiblyJson(value);
   if (!parsed || typeof parsed !== "object") {
     return undefined;
+  }
+
+  if (parsed.config && typeof parsed.config === "object" && parsed.config.oauth2Config && typeof parsed.config.oauth2Config === "object") {
+    return parsed.config.oauth2Config;
   }
 
   if (parsed.config && typeof parsed.config === "object" && parsed.config.case === "oauth2Config" && parsed.config.value) {

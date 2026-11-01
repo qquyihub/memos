@@ -113,10 +113,14 @@ export async function apiRequest<T>(method: string, path: string, body?: unknown
     const errorData = await resp.json().catch(() => ({ error: resp.statusText }));
     const errorParams =
       errorData.errorParams && typeof errorData.errorParams === "object" ? (errorData.errorParams as Record<string, unknown>) : undefined;
+    const serverMessage =
+      (typeof errorData.message === "string" ? errorData.message : undefined) ||
+      (typeof errorData.error === "string" ? errorData.error : undefined) ||
+      `HTTP ${resp.status}`;
     const translatedMessage =
       errorData.errorKey && typeof errorData.errorKey === "string" ? i18n.t(errorData.errorKey, errorParams || {}) : undefined;
-    const err = new Error(translatedMessage || errorData.error || `HTTP ${resp.status}`) as ApiRequestError;
-    err.serverMessage = errorData.error || `HTTP ${resp.status}`;
+    const err = new Error(translatedMessage || serverMessage) as ApiRequestError;
+    err.serverMessage = serverMessage;
     err.errorKey = typeof errorData.errorKey === "string" ? errorData.errorKey : undefined;
     err.errorParams = errorParams;
     err.code = resp.status === 401 ? 16 : resp.status === 403 ? 7 : resp.status === 404 ? 5 : 2;

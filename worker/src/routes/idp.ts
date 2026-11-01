@@ -19,17 +19,31 @@ idpRoutes.get("/", async (c) => {
   return c.json({ identityProviders: (results || []).map((row) => serializeIdentityProvider(row)) });
 });
 
+idpRoutes.get("/:id", async (c) => {
+  const id = extractIdentityProviderUid(c.req.param("id"));
+  const result = await c.env.DB.prepare("SELECT * FROM idp WHERE id = ? OR uid = ?").bind(id, id).first<IdpRow>();
+  if (!result) {
+    return c.json({ error: "Identity provider not found" }, 404);
+  }
+  return c.json(serializeIdentityProvider(result));
+});
+
 idpRoutes.post("/", authRequired, async (c) => {
   const user = c.get("user");
   if (user.role !== "ADMIN") return c.json({ error: "Admin only" }, 403);
 
-  const body = await c.req.json();
-  const requestedId = extractIdentityProviderUid(body.identityProviderId || body.name);
+  const body = await c.req.json<Record<string, any>>();
+  const identityProvider = body.identityProvider ?? body;
+  const requestedId = extractIdentityProviderUid(
+    c.req.query("identityProviderId") || c.req.query("identity_provider_id") || identityProvider.name,
+  );
   const uid = requestedId || crypto.randomUUID().replace(/-/g, "").slice(0, 22);
-  const title = typeof body.title === "string" && body.title.trim() ? body.title.trim() : uid;
-  const type = normalizeIdentityProviderType(body.type);
-  const identifierFilter = body.identifierFilter || body.identifier_filter || "";
-  const config = normalizeStoredOAuth2Config(body.config);
+  const title = typeof identityProvider.title === "string" && identityProvider.title.trim()
+    ? identityProvider.title.trim()
+    : uid;
+  const type = normalizeIdentityProviderType(identityProvider.type);
+  const identifierFilter = identityProvider.identifierFilter || identityProvider.identifier_filter || "";
+  const config = normalizeStoredOAuth2Config(identityProvider.config);
   const result = await c.env.DB.prepare(
     "INSERT INTO idp (uid, name, type, identifier_filter, config) VALUES (?, ?, ?, ?, ?) RETURNING *"
   )
@@ -46,7 +60,6 @@ idpRoutes.post("/", authRequired, async (c) => {
         config: JSON.stringify(config),
       },
     ),
-    201,
   );
 });
 
@@ -55,31 +68,32 @@ idpRoutes.patch("/:id", authRequired, async (c) => {
   if (user.role !== "ADMIN") return c.json({ error: "Admin only" }, 403);
 
   const id = extractIdentityProviderUid(c.req.param("id"));
-  const body = await c.req.json();
+  const body = await c.req.json<Record<string, any>>();
+  const identityProvider = body.identityProvider ?? body;
   const updates: string[] = [];
   const params: unknown[] = [];
 
   const title =
-    typeof body.title === "string"
-      ? body.title.trim()
-      : typeof body.name === "string" && !body.name.startsWith(buildIdentityProviderName(""))
-        ? body.name.trim()
+    typeof identityProvider.title === "string"
+      ? identityProvider.title.trim()
+      : typeof identityProvider.name === "string" && !identityProvider.name.startsWith(buildIdentityProviderName(""))
+        ? identityProvider.name.trim()
         : undefined;
   if (title !== undefined) {
     updates.push("name = ?");
     params.push(title);
   }
-  if (body.type !== undefined) {
+  if (identityProvider.type !== undefined) {
     updates.push("type = ?");
-    params.push(normalizeIdentityProviderType(body.type));
+    params.push(normalizeIdentityProviderType(identityProvider.type));
   }
-  if (body.identifierFilter !== undefined || body.identifier_filter !== undefined) {
+  if (identityProvider.identifierFilter !== undefined || identityProvider.identifier_filter !== undefined) {
     updates.push("identifier_filter = ?");
-    params.push(body.identifierFilter ?? body.identifier_filter ?? "");
+    params.push(identityProvider.identifierFilter ?? identityProvider.identifier_filter ?? "");
   }
-  if (body.config !== undefined) {
+  if (identityProvider.config !== undefined) {
     const existing = await c.env.DB.prepare("SELECT * FROM idp WHERE id = ? OR uid = ?").bind(id, id).first<IdpRow>();
-    const nextConfig = normalizeStoredOAuth2Config(body.config);
+    const nextConfig = normalizeStoredOAuth2Config(identityProvider.config);
     if (nextConfig.clientSecret === "" && existing) {
       const existingConfig = normalizeStoredOAuth2Config(existing.config);
       nextConfig.clientSecret = existingConfig.clientSecret;

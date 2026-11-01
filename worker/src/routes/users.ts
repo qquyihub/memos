@@ -32,15 +32,13 @@ const getGeneralSetting = async (db: D1Database) => {
 export function formatUser(user: userDB.UserRow, options: { includeEmail?: boolean } = {}) {
   return {
     name: `users/${user.username}`,
-    id: user.id,
+    role: user.role === "ADMIN" ? "ADMIN" : "USER",
     username: user.username,
-    role: user.role,
-    displayName: user.nickname,
-    nickname: user.nickname,
     email: options.includeEmail ? user.email : "",
+    displayName: user.nickname,
     avatarUrl: user.avatar_url,
     description: user.description,
-    rowStatus: user.row_status,
+    state: user.row_status === "ARCHIVED" ? "ARCHIVED" : "NORMAL",
     createTime: new Date(user.created_ts * 1000).toISOString(),
     updateTime: new Date(user.updated_ts * 1000).toISOString(),
   };
@@ -61,6 +59,47 @@ function formatPersonalAccessToken(username: string, token: {
     lastUsedAt: token.lastUsedAt || undefined,
     hash: token.hash,
   };
+}
+
+function normalizeUserSettingKey(key: string) {
+  return String(key || "").toUpperCase();
+}
+
+function parseSettingObject(value?: string) {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return typeof parsed === "object" && parsed !== null ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function findUserSettingRow(db: D1Database, userId: number, key: string) {
+  for (const candidate of [key, key.toUpperCase(), key.toLowerCase()]) {
+    const row = await settingDB.getUserSetting(db, userId, candidate);
+    if (row) return row;
+  }
+  return null;
+}
+
+async function buildUserSettingEntity(db: D1Database, username: string, userId: number, key: string) {
+  const normalizedKey = normalizeUserSettingKey(key);
+  if (normalizedKey === "WEBHOOKS") {
+    const webhooks = await webhookDB.listWebhooksByCreatorId(db, userId);
+    return {
+      name: `users/${username}/settings/WEBHOOKS`,
+      webhooksSetting: { webhooks: webhooks.map((webhook) => formatWebhook(webhook, username)) },
+    };
+  }
+  if (normalizedKey === "GENERAL") {
+    const row = await findUserSettingRow(db, userId, "GENERAL");
+    return {
+      name: `users/${username}/settings/GENERAL`,
+      generalSetting: parseSettingObject(row?.value),
+    };
+  }
+  return { name: `users/${username}/settings/${key}` };
 }
 
 const USER_STATS_CACHE_SCOPES = ["public", "authenticated", "owner"] as const;
@@ -97,38 +136,26 @@ userRoutes.get("/", authOptional, async (c) => {
   return c.json({ users: users.map((user) => formatUser(user, { includeEmail })), nextPageToken: "", totalSize: users.length });
 });
 
-// Batch get users
-userRoutes.post("/:batchGet", async (c) => {
-  const action = c.req.param("batchGet");
-  if (action !== "batchGet") return c.notFound();
-
-  const body = await c.req.json<{ usernames: string[] }>();
-  const users = (await userDB.findUsersByUsernames(c.env.DB, body.usernames || [])).filter((user) => user.row_status === "NORMAL");
-  return c.json({ users: users.map((user) => formatUser(user)) });
-});
-
-// Get user stats
-userRoutes.get("/:username/stats", authOptional, async (c) => {
-  const username = c.req.param("username");
-  const user = await userDB.findUserByUsername(c.env.DB, username);
-  if (!user) return c.json({ error: "User not found" }, 404);
-
-  const currentUser = c.get("user");
+async function buildUserStats(
+  c: { env: Env; get: (key: "user") => UserPayload | undefined },
+  user: userDB.UserRow,
+  currentUser: UserPayload | undefined,
+) {
   const conditions = ["creator_id = ?", "row_status = 'NORMAL'"];
   const scope = appendStatsVisibilityFilter(conditions, user.id, currentUser);
-  const cacheKey = `user:stats:${username}:${scope}`;
+  const cacheKey = `user:stats:${user.username}:${scope}`;
   const cached = scope === "owner" ? undefined : await getCachedJson(c.env.CACHE, cacheKey);
   if (cached) {
-    return c.json(cached);
+    return cached;
   }
 
   const { results: memos } = await c.env.DB.prepare(
-    `SELECT created_ts, updated_ts, payload, pinned FROM memo WHERE ${conditions.join(" AND ")}`
-  ).bind(user.id).all<{ created_ts: number; updated_ts: number; payload: string; pinned: number }>();
+    `SELECT uid, created_ts, updated_ts, payload, pinned FROM memo WHERE ${conditions.join(" AND ")}`
+  ).bind(user.id).all<{ uid: string; created_ts: number; updated_ts: number; payload: string; pinned: number }>();
 
   const tagCounts: Record<string, number> = {};
   let linkCount = 0, codeCount = 0, todoCount = 0, undoCount = 0;
-  const pinnedMemos: number[] = [];
+  const pinnedMemos: string[] = [];
 
   for (const m of memos) {
     const payload = JSON.parse(m.payload || "{}");
@@ -140,75 +167,120 @@ userRoutes.get("/:username/stats", authOptional, async (c) => {
     if (payload.property?.hasLink) linkCount++;
     if (payload.property?.hasCode) codeCount++;
     if (payload.property?.hasTaskList) todoCount++;
-    if (payload.property?.hasIncompleteTask) undoCount++;
-    if (m.pinned) pinnedMemos.push(m.created_ts);
+    if (payload.property?.hasIncompleteTasks || payload.property?.hasIncompleteTask) undoCount++;
+    if (m.pinned) pinnedMemos.push(`memos/${m.uid}`);
   }
 
   const response = {
-    name: `users/${username}/stats`,
-    memoCount: memos.length,
-    tagCount: tagCounts,
+    name: `users/${user.username}`,
     memoTypeStats: { linkCount, codeCount, todoCount, undoCount },
+    tagCount: tagCounts,
+    memoCreatedTimestamps: memos.map((m) => new Date(m.created_ts * 1000).toISOString()),
+    memoUpdatedTimestamps: memos.map((m) => new Date(m.updated_ts * 1000).toISOString()),
     pinnedMemos,
-    memoCreatedTimestamps: memos.map((m) => ({ seconds: m.created_ts, nanos: 0 })),
-    memoUpdatedTimestamps: memos.map((m) => ({ seconds: m.updated_ts, nanos: 0 })),
+    totalMemoCount: memos.length,
   };
 
   if (scope !== "owner") {
     await putCachedJson(c.env.CACHE, cacheKey, response, 60);
   }
+  return response;
+}
+
+// Action routes mounted at /api/v1 (colon-style endpoints)
+export const userActionRoutes = new Hono<UserApp>();
+
+userActionRoutes.post("/users\\:batchGet", async (c) => {
+  const body = await c.req.json<{ usernames: string[] }>();
+  const users = (await userDB.findUsersByUsernames(c.env.DB, body.usernames || [])).filter((user) => user.row_status === "NORMAL");
+  return c.json({ users: users.map((user) => formatUser(user)) });
+});
+
+userActionRoutes.get("/users\\:stats", authOptional, async (c) => {
+  const cached = await getCachedJson(c.env.CACHE, "user:stats:all:public");
+  if (cached) {
+    return c.json(cached);
+  }
+
+  const users = await userDB.listUsers(c.env.DB, { rowStatus: "NORMAL" });
+  const { results: memos } = await c.env.DB.prepare(
+    "SELECT creator_id, payload FROM memo WHERE row_status = 'NORMAL' AND visibility = 'PUBLIC'"
+  ).all<{ creator_id: number; payload: string }>();
+
+  const memoStatsByUserId = new Map<number, {
+    totalMemoCount: number;
+    tagCount: Record<string, number>;
+    linkCount: number;
+    codeCount: number;
+    todoCount: number;
+    undoCount: number;
+  }>();
+  for (const memo of memos) {
+    const stats = memoStatsByUserId.get(memo.creator_id) || {
+      totalMemoCount: 0,
+      tagCount: {},
+      linkCount: 0,
+      codeCount: 0,
+      todoCount: 0,
+      undoCount: 0,
+    };
+    stats.totalMemoCount += 1;
+    const payload = JSON.parse(memo.payload || "{}");
+    if (payload.tags) {
+      for (const tag of payload.tags) {
+        stats.tagCount[tag] = (stats.tagCount[tag] || 0) + 1;
+      }
+    }
+    if (payload.property?.hasLink) stats.linkCount++;
+    if (payload.property?.hasCode) stats.codeCount++;
+    if (payload.property?.hasTaskList) stats.todoCount++;
+    if (payload.property?.hasIncompleteTasks || payload.property?.hasIncompleteTask) stats.undoCount++;
+    memoStatsByUserId.set(memo.creator_id, stats);
+  }
+
+  const stats = users.map((user) => {
+    const memoStats = memoStatsByUserId.get(user.id) || {
+      totalMemoCount: 0,
+      tagCount: {},
+      linkCount: 0,
+      codeCount: 0,
+      todoCount: 0,
+      undoCount: 0,
+    };
+    return {
+      name: `users/${user.username}`,
+      memoTypeStats: {
+        linkCount: memoStats.linkCount,
+        codeCount: memoStats.codeCount,
+        todoCount: memoStats.todoCount,
+        undoCount: memoStats.undoCount,
+      },
+      tagCount: memoStats.tagCount,
+      totalMemoCount: memoStats.totalMemoCount,
+    };
+  });
+  const response = { stats };
+  await putCachedJson(c.env.CACHE, "user:stats:all:public", response, 60);
   return c.json(response);
 });
 
-// Get all user stats
-userRoutes.get("/:action", authOptional, async (c) => {
-  const action = c.req.param("action");
-  if (action === "stats") {
-    const cached = await getCachedJson(c.env.CACHE, "user:stats:all:public");
-    if (cached) {
-      return c.json(cached);
-    }
+// Get user (or user stats when the path ends with ":getStats")
+userRoutes.get("/:username", authOptional, async (c) => {
+  let username = c.req.param("username");
+  const currentUser = c.get("user");
 
-    const users = await userDB.listUsers(c.env.DB, { rowStatus: "NORMAL" });
-    const { results: memos } = await c.env.DB.prepare(
-      "SELECT creator_id, payload FROM memo WHERE row_status = 'NORMAL' AND visibility = 'PUBLIC'"
-    ).all<{ creator_id: number; payload: string }>();
-
-    const memoStatsByUserId = new Map<number, { memoCount: number; tagCount: Record<string, number> }>();
-    for (const memo of memos) {
-      const stats = memoStatsByUserId.get(memo.creator_id) || { memoCount: 0, tagCount: {} };
-      stats.memoCount += 1;
-      const payload = JSON.parse(memo.payload || "{}");
-      if (payload.tags) {
-        for (const tag of payload.tags) {
-          stats.tagCount[tag] = (stats.tagCount[tag] || 0) + 1;
-        }
-      }
-      memoStatsByUserId.set(memo.creator_id, stats);
-    }
-
-    const stats = users.map((user) => {
-      const memoStats = memoStatsByUserId.get(user.id) || { memoCount: 0, tagCount: {} };
-      return {
-        name: `users/${user.username}/stats`,
-        username: user.username,
-        memoCount: memoStats.memoCount,
-        tagCount: memoStats.tagCount,
-      };
-    });
-    const response = { stats };
-    await putCachedJson(c.env.CACHE, "user:stats:all:public", response, 60);
-    return c.json(response);
+  if (username.endsWith(":getStats")) {
+    username = username.slice(0, -":getStats".length);
+    const user = await userDB.findUserByUsername(c.env.DB, username);
+    if (!user) return c.json({ error: "User not found" }, 404);
+    return c.json(await buildUserStats(c, user, currentUser));
   }
 
-  // Get user by username (or numeric ID as fallback)
-  const username = action;
   let user = await userDB.findUserByUsername(c.env.DB, username);
   if (!user && /^\d+$/.test(username)) {
     user = await c.env.DB.prepare("SELECT * FROM user WHERE id = ?").bind(Number(username)).first<userDB.UserRow>();
   }
   if (!user) return c.json({ error: "User not found" }, 404);
-  const currentUser = c.get("user");
   if (user.row_status !== "NORMAL" && currentUser?.id !== user.id && currentUser?.role !== "ADMIN") {
     return c.json({ error: "User not found" }, 404);
   }
@@ -233,7 +305,7 @@ userRoutes.post("/", async (c) => {
     const passwordHash = await hashPassword(password);
     const user = await userDB.createUser(c.env.DB, { username, passwordHash, role: "ADMIN" });
     await deleteCachedKeys(c.env.CACHE, ["instance:profile", "user:stats:all", "user:stats:all:public"]);
-    return c.json(formatUser(user, { includeEmail: true }), 201);
+    return c.json(formatUser(user, { includeEmail: true }));
   }
 
   // Check if self-registration is allowed
@@ -271,12 +343,13 @@ userRoutes.post("/", async (c) => {
   if (existing) return c.json({ error: "Username taken" }, 409);
 
   // Only admin can create admin users
-  const role = isAdmin && userData.role === 2 ? "ADMIN" : "USER";
+  const wantsAdmin = userData.role === 2 || String(userData.role || "").toUpperCase() === "ADMIN";
+  const role = isAdmin && wantsAdmin ? "ADMIN" : "USER";
   const passwordHash = await hashPassword(password);
   const user = await userDB.createUser(c.env.DB, { username, passwordHash, role });
   await deleteCachedKeys(c.env.CACHE, ["instance:profile", "user:stats:all", "user:stats:all:public"]);
 
-  return c.json(formatUser(user, { includeEmail: true }), 201);
+  return c.json(formatUser(user, { includeEmail: true }));
 });
 
 // Update user
@@ -306,7 +379,13 @@ userRoutes.patch("/:username", authRequired, async (c) => {
   if (body.avatarUrl !== undefined) updateData.avatar_url = body.avatarUrl;
   if (body.description !== undefined) updateData.description = body.description;
   if (body.password) updateData.password_hash = await hashPassword(body.password);
-  if (body.role && currentUser.role === "ADMIN") updateData.role = body.role;
+  if ((body.role !== undefined || body.state !== undefined) && currentUser.role === "ADMIN") {
+    if (body.role !== undefined) {
+      const roleValue = typeof body.role === "number" ? (body.role === 2 ? "ADMIN" : "USER") : String(body.role).toUpperCase();
+      updateData.role = roleValue === "ADMIN" ? "ADMIN" : "USER";
+    }
+    if (body.state !== undefined) updateData.row_status = body.state;
+  }
   if (body.rowStatus !== undefined) updateData.row_status = body.rowStatus;
   if (body.username !== undefined) {
     if (currentUser.role === "ADMIN") {
@@ -361,8 +440,11 @@ userRoutes.get("/:username/settings", authRequired, async (c) => {
     return c.json({ error: "Permission denied" }, 403);
   }
 
-  const settings = await settingDB.listUserSettings(c.env.DB, user.id);
-  return c.json({ settings });
+  const settings = await Promise.all([
+    buildUserSettingEntity(c.env.DB, username, user.id, "GENERAL"),
+    buildUserSettingEntity(c.env.DB, username, user.id, "WEBHOOKS"),
+  ]);
+  return c.json({ settings, nextPageToken: "", totalSize: settings.length });
 });
 
 userRoutes.get("/:username/settings/:key", authRequired, async (c) => {
@@ -375,8 +457,7 @@ userRoutes.get("/:username/settings/:key", authRequired, async (c) => {
     return c.json({ error: "Permission denied" }, 403);
   }
 
-  const setting = await settingDB.getUserSetting(c.env.DB, user.id, key);
-  return c.json({ setting: setting || { key, value: "" } });
+  return c.json(await buildUserSettingEntity(c.env.DB, username, user.id, key));
 });
 
 userRoutes.patch("/:username/settings/:key", authRequired, async (c) => {
@@ -389,11 +470,27 @@ userRoutes.patch("/:username/settings/:key", authRequired, async (c) => {
     return c.json({ error: "Permission denied" }, 403);
   }
 
-  const body = await c.req.json<{ value: any }>();
-  const newValue = typeof body.value === "string" ? JSON.parse(body.value) : (body.value || {});
+  const normalizedKey = normalizeUserSettingKey(key);
+  if (normalizedKey === "WEBHOOKS") {
+    return c.json(await buildUserSettingEntity(c.env.DB, username, user.id, "WEBHOOKS"));
+  }
+
+  const body = await c.req.json<Record<string, any>>();
+  const settingInput = body.setting ?? body;
+  let newValue = settingInput.generalSetting ?? settingInput.value ?? {};
+  if (typeof newValue === "string") {
+    try {
+      newValue = JSON.parse(newValue);
+    } catch {
+      newValue = {};
+    }
+  }
+  if (typeof newValue !== "object" || newValue === null) {
+    newValue = {};
+  }
 
   // Merge with existing setting value
-  const existing = await settingDB.getUserSetting(c.env.DB, user.id, key);
+  const existing = await findUserSettingRow(c.env.DB, user.id, key);
   let merged = newValue;
   if (existing) {
     try {
@@ -404,9 +501,8 @@ userRoutes.patch("/:username/settings/:key", authRequired, async (c) => {
     }
   }
 
-  const valueStr = JSON.stringify(merged);
-  await settingDB.setUserSetting(c.env.DB, user.id, key, valueStr);
-  return c.json({ setting: { key, value: valueStr } });
+  await settingDB.setUserSetting(c.env.DB, user.id, normalizedKey === "GENERAL" ? "GENERAL" : key, JSON.stringify(merged));
+  return c.json(await buildUserSettingEntity(c.env.DB, username, user.id, key));
 });
 
 // --- Personal Access Tokens ---
@@ -464,9 +560,8 @@ userRoutes.post("/:username/personalAccessTokens", authRequired, async (c) => {
   await settingDB.setUserSetting(c.env.DB, user.id, "personal_access_tokens", JSON.stringify(tokens));
 
   return c.json({
-    token,
-    description: body.description || "",
     personalAccessToken: formatPersonalAccessToken(username, tokenRecord),
+    token,
   });
 });
 
@@ -562,7 +657,7 @@ userRoutes.post("/:username/linkedIdentities", authRequired, async (c) => {
     name: `users/${username}/linkedIdentities/${result!.id}`,
     idpName: buildIdentityProviderName(result!.provider),
     externUid: result!.extern_uid,
-  }, 201);
+  });
 });
 
 userRoutes.delete("/:username/linkedIdentities/:identityId", authRequired, async (c) => {
@@ -582,6 +677,44 @@ userRoutes.delete("/:username/linkedIdentities/:identityId", authRequired, async
 });
 
 // --- User Notifications ---
+function formatUserNotification(
+  username: string,
+  row: { id: number; created_ts: number; sender_id: number; status: string; message: string },
+  sender?: userDB.UserRow,
+) {
+  const msg = JSON.parse(row.message || "{}");
+  const type = msg.type === "MEMO_MENTION"
+    ? "MEMO_MENTION"
+    : msg.type === "MEMO_COMMENT"
+      ? "MEMO_COMMENT"
+      : "TYPE_UNSPECIFIED";
+
+  const notification: Record<string, any> = {
+    name: `users/${username}/notifications/${row.id}`,
+    sender: sender ? `users/${sender.username}` : "",
+    status: row.status === "ARCHIVED" ? "ARCHIVED" : "UNREAD",
+    createTime: new Date(row.created_ts * 1000).toISOString(),
+    type,
+  };
+  if (sender) {
+    notification.senderUser = formatUser(sender);
+  }
+
+  const payload = {
+    memo: msg.memo || "",
+    relatedMemo: msg.relatedMemo || "",
+    memoSnippet: msg.memoSnippet || "",
+    relatedMemoSnippet: msg.relatedMemoSnippet || "",
+  };
+  if (type === "MEMO_COMMENT") {
+    notification.memoComment = payload;
+  } else if (type === "MEMO_MENTION") {
+    notification.memoMention = payload;
+  }
+
+  return notification;
+}
+
 userRoutes.get("/:username/notifications", authRequired, async (c) => {
   const username = c.req.param("username");
   const currentUser = c.get("user");
@@ -596,69 +729,44 @@ userRoutes.get("/:username/notifications", authRequired, async (c) => {
   ).bind(user.id).all<{ id: number; created_ts: number; sender_id: number; receiver_id: number; status: string; message: string }>();
 
   const senderIds = [...new Set((results || []).map((r) => r.sender_id))];
-  const senderMap = new Map<number, { username: string; nickname: string; avatar_url: string }>();
+  const senderMap = new Map<number, userDB.UserRow>();
   const senders = await userDB.findUsersByIds(c.env.DB, senderIds);
   for (const sender of senders) {
-    senderMap.set(sender.id, {
-      username: sender.username,
-      nickname: sender.nickname,
-      avatar_url: sender.avatar_url,
-    });
+    senderMap.set(sender.id, sender);
   }
 
-  const notifications = (results || []).map((row) => {
-    const msg = JSON.parse(row.message || "{}");
-    const sender = senderMap.get(row.sender_id);
-    const statusMap: Record<string, number> = { UNREAD: 1, ARCHIVED: 2 };
-    const typeMap: Record<string, number> = { MEMO_COMMENT: 1, MEMO_MENTION: 2 };
+  const notifications = (results || []).map((row) =>
+    formatUserNotification(username, row, senderMap.get(row.sender_id))
+  );
 
-    return {
-      name: `users/${username}/notifications/${row.id}`,
-      sender: sender ? `users/${sender.username}` : "",
-      senderUser: sender ? {
-        name: `users/${sender.username}`,
-        username: sender.username,
-        displayName: sender.nickname || sender.username,
-        avatarUrl: sender.avatar_url || "",
-      } : undefined,
-      status: statusMap[row.status] || 0,
-      createTime: { seconds: row.created_ts, nanos: 0 },
-      type: typeMap[msg.type] || 0,
-      payload: msg.type === "MEMO_COMMENT" ? {
-        case: "memoComment",
-        value: {
-          memo: msg.memo || "",
-          relatedMemo: msg.relatedMemo || "",
-          memoSnippet: msg.memoSnippet || "",
-          relatedMemoSnippet: msg.relatedMemoSnippet || "",
-        },
-      } : msg.type === "MEMO_MENTION" ? {
-        case: "memoMention",
-        value: {
-          memo: msg.memo || "",
-          relatedMemo: msg.relatedMemo || "",
-          memoSnippet: msg.memoSnippet || "",
-          relatedMemoSnippet: msg.relatedMemoSnippet || "",
-        },
-      } : { case: undefined },
-    };
-  });
-
-  return c.json({ notifications });
+  return c.json({ notifications, nextPageToken: "" });
 });
 
 userRoutes.patch("/:username/notifications/:notifId", authRequired, async (c) => {
+  const username = c.req.param("username");
   const notifId = Number(c.req.param("notifId"));
   const currentUser = c.get("user");
-  const body = await c.req.json<{ status: string | number }>();
+  if (username !== currentUser.username && currentUser.role !== "ADMIN") {
+    return c.json({ error: "Permission denied" }, 403);
+  }
 
+  const body = await c.req.json<Record<string, any>>();
+  const notificationInput = body.notification ?? body;
   const statusMap: Record<number, string> = { 1: "UNREAD", 2: "ARCHIVED" };
-  const status = typeof body.status === "number" ? (statusMap[body.status] || "UNREAD") : body.status;
+  const status = typeof notificationInput.status === "number"
+    ? (statusMap[notificationInput.status] || "UNREAD")
+    : notificationInput.status;
 
   await c.env.DB.prepare("UPDATE inbox SET status = ? WHERE id = ? AND receiver_id = ?")
     .bind(status, notifId, currentUser.id).run();
 
-  return c.json({});
+  const row = await c.env.DB.prepare(
+    "SELECT * FROM inbox WHERE id = ? AND receiver_id = ?"
+  ).bind(notifId, currentUser.id).first<{ id: number; created_ts: number; sender_id: number; receiver_id: number; status: string; message: string }>();
+  if (!row) return c.json({ error: "Notification not found" }, 404);
+
+  const [sender] = await userDB.findUsersByIds(c.env.DB, [row.sender_id]);
+  return c.json(formatUserNotification(username, row, sender));
 });
 
 userRoutes.delete("/:username/notifications/:notifId", authRequired, async (c) => {
@@ -713,7 +821,7 @@ userRoutes.post("/:username/webhooks", authRequired, async (c) => {
     url: normalizeWebhookUrl(body.url)!,
     displayName: body.displayName?.trim() || "",
   });
-  return c.json(formatWebhook(webhook, username), 201);
+  return c.json(formatWebhook(webhook, username));
 });
 
 userRoutes.patch("/:username/webhooks/:webhookId", authRequired, async (c) => {
