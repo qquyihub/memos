@@ -4,6 +4,7 @@ import type { Env, UserPayload } from "../types";
 import { authOptional } from "../middleware/auth";
 import { verifyRefreshToken } from "../auth/jwt";
 import * as shareDB from "../db/share";
+import { createStorageBackend, getStorageConfig, normalizeStorageType } from "../storage";
 
 type FileApp = { Bindings: Env; Variables: { user: UserPayload } };
 
@@ -98,7 +99,7 @@ fileRoutes.get("/attachments/:uid/:filename", authOptional, async (c) => {
 
   const att = await c.env.DB.prepare(
     "SELECT * FROM attachment WHERE uid = ?"
-  ).bind(uid).first<{ id: number; creator_id: number; type: string; size: number; reference: string; memo_id: number | null; filename: string }>();
+  ).bind(uid).first<{ id: number; creator_id: number; type: string; size: number; reference: string; memo_id: number | null; filename: string; storage_type: string }>();
 
   if (!att) return c.notFound();
 
@@ -140,10 +141,13 @@ fileRoutes.get("/attachments/:uid/:filename", authOptional, async (c) => {
   }
 
   const range = parseRangeHeader(c.req.header("Range"), att.size);
-  const r2Object = range
-    ? await c.env.BUCKET.get(att.reference, { range: { offset: range.start, length: range.length } })
-    : await c.env.BUCKET.get(att.reference);
-  if (!r2Object) {
+  const storageConfig = await getStorageConfig(c.env.DB);
+  const storage = createStorageBackend(c.env, storageConfig, normalizeStorageType(att.storage_type));
+  const stored = await storage.get(
+    att.reference,
+    range ? { offset: range.start, length: range.length } : undefined,
+  );
+  if (!stored) {
     return c.notFound();
   }
 
@@ -158,17 +162,18 @@ fileRoutes.get("/attachments/:uid/:filename", authOptional, async (c) => {
     "Accept-Ranges": "bytes",
   };
 
-  if (range) {
-    headers["Content-Range"] = `bytes ${range.start}-${range.end}/${att.size}`;
+  if (range && stored.partial) {
+    headers["Content-Range"] = `bytes ${range.start}-${range.end}/${stored.size || att.size}`;
     headers["Content-Length"] = String(range.length);
-    return new Response(r2Object.body, { status: 206, headers });
+    return new Response(stored.body, { status: 206, headers });
   }
 
-  if (r2Object.size) {
-    headers["Content-Length"] = String(r2Object.size);
+  const totalSize = stored.size || att.size;
+  if (totalSize) {
+    headers["Content-Length"] = String(totalSize);
   }
 
-  return new Response(r2Object.body, { status: 200, headers });
+  return new Response(stored.body, { status: 200, headers });
 });
 
 // Serve user avatar
@@ -192,7 +197,7 @@ fileRoutes.get("/users/:identifier/avatar", async (c) => {
   }
 
   // If avatar is an R2 reference
-  if (user.avatar_url.startsWith("avatars/")) {
+  if (user.avatar_url.startsWith("avatars/") && c.env.BUCKET) {
     const r2Object = await c.env.BUCKET.get(user.avatar_url);
     if (r2Object) {
       return new Response(r2Object.body, {
