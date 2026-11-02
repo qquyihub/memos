@@ -4,6 +4,7 @@ export interface ReactionRow {
   creator_id: number;
   content_id: string;
   reaction_type: string;
+  creator_username?: string;
 }
 
 export async function listReactions(
@@ -11,7 +12,11 @@ export async function listReactions(
   contentId: string
 ): Promise<ReactionRow[]> {
   const { results } = await db
-    .prepare("SELECT * FROM reaction WHERE content_id = ? ORDER BY created_ts ASC")
+    .prepare(
+      `SELECT reaction.*, user.username AS creator_username
+       FROM reaction LEFT JOIN user ON user.id = reaction.creator_id
+       WHERE reaction.content_id = ? ORDER BY reaction.created_ts ASC`
+    )
     .bind(contentId)
     .all<ReactionRow>();
   return results;

@@ -45,14 +45,27 @@ interface LinkMetadata {
 
 const MAX_LINK_METADATA_BATCH_SIZE = 10;
 const MAX_LINK_METADATA_URL_LENGTH = 2048;
+const MAX_LINK_METADATA_BYTES = 512 * 1024;
+const LINK_METADATA_TIMEOUT_MS = 10_000;
+const MAX_LINK_METADATA_REDIRECTS = 3;
 
 function isBlockedLinkMetadataHostname(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  if (!host || host === "localhost" || host.endsWith(".localhost") || host === "metadata.google.internal") {
+  if (!host || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host === "metadata.google.internal") {
     return true;
   }
-  if (host === "::1" || (host.includes(":") && (host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80:")))) {
-    return true;
+
+  if (host.includes(":")) {
+    // IPv6: loopback, unspecified, unique-local (fc00::/7), link-local (fe80::/10),
+    // and IPv4-mapped addresses (which can bypass the IPv4 checks below).
+    return (
+      host === "::" ||
+      host === "::1" ||
+      host.startsWith("::ffff:") ||
+      host.startsWith("fc") ||
+      host.startsWith("fd") ||
+      host.startsWith("fe80:")
+    );
   }
 
   const ipv4Parts = host.split(".");
@@ -65,14 +78,20 @@ function isBlockedLinkMetadataHostname(hostname: string): boolean {
     return false;
   }
 
-  const [first, second] = octets;
+  const [first, second, third] = octets;
   return (
     first === 0 ||
     first === 10 ||
     first === 127 ||
+    (first === 100 && second >= 64 && second <= 127) ||
     (first === 169 && second === 254) ||
     (first === 172 && second >= 16 && second <= 31) ||
-    (first === 192 && second === 168)
+    (first === 192 && second === 0 && (third === 0 || third === 2)) ||
+    (first === 192 && second === 168) ||
+    (first === 198 && (second === 18 || second === 19)) ||
+    (first === 198 && second === 51 && third === 100) ||
+    (first === 203 && second === 0 && third === 113) ||
+    first >= 224
   );
 }
 
@@ -141,7 +160,7 @@ function formatMemo(memo: memoDB.MemoRow, creatorUsername?: string) {
   return {
     name: `memos/${memo.uid}`,
     state: memo.row_status === "ARCHIVED" ? "ARCHIVED" : "NORMAL",
-    creator: `users/${creatorUsername || memo.creator_id}`,
+    creator: `users/${creatorUsername || memo.creator_username || memo.creator_id}`,
     createTime: new Date(memo.created_ts * 1000).toISOString(),
     updateTime: new Date(memo.updated_ts * 1000).toISOString(),
     content: memo.content,
@@ -188,6 +207,33 @@ function chunkValues<T>(values: T[], size: number): T[][] {
   return chunks;
 }
 
+/**
+ * Collect the memo id and its COMMENT descendants. In this schema a comment
+ * relation is stored as (memo_id = parent, related_memo_id = comment).
+ */
+async function collectCommentTree(db: D1Database, rootId: number): Promise<number[]> {
+  const all = new Set<number>([rootId]);
+  let frontier = [rootId];
+
+  while (frontier.length > 0) {
+    const next: number[] = [];
+    for (const chunk of chunkValues(frontier, 900)) {
+      const { results } = await db.prepare(
+        `SELECT related_memo_id FROM memo_relation WHERE type = 'COMMENT' AND memo_id IN (${createPlaceholders(chunk.length)})`
+      ).bind(...chunk).all<{ related_memo_id: number }>();
+      for (const row of results) {
+        if (!all.has(row.related_memo_id)) {
+          all.add(row.related_memo_id);
+          next.push(row.related_memo_id);
+        }
+      }
+    }
+    frontier = next;
+  }
+
+  return [...all];
+}
+
 function formatAttachmentEntity(att: any, memoUid?: string) {
   let motionMedia: unknown;
   try {
@@ -214,14 +260,11 @@ async function getMemoAttachments(db: D1Database, memoId: number, memoUid: strin
 }
 
 async function getMemoRelations(db: D1Database, memoId: number, user?: UserPayload) {
-  const relations = await relationDB.listRelations(db, memoId);
-  const relationMemoMap = await getMemoSnippetMapByIds(db, relations.flatMap((relation) => [relation.memo_id, relation.related_memo_id]));
+  const relations = await listRelationsWithMemoByMemoIds(db, [memoId]);
   const resolved = relations.map((relation) => {
-    const memo = relationMemoMap.get(relation.memo_id);
-    const relatedMemo = relationMemoMap.get(relation.related_memo_id);
     const formattedRelation = {
-      memo: formatMemoRelationSnippet(memo, user),
-      relatedMemo: formatMemoRelationSnippet(relatedMemo, user),
+      memo: formatMemoRelationSnippet(relationMemoRef(relation, "memo"), user),
+      relatedMemo: formatMemoRelationSnippet(relationMemoRef(relation, "related"), user),
       type: relation.type,
     };
     return formattedRelation.memo && formattedRelation.relatedMemo ? formattedRelation : undefined;
@@ -239,27 +282,9 @@ function formatReaction(reaction: reactionDB.ReactionRow, creatorUsername?: stri
   };
 }
 
-async function resolveUsernamesByIds(db: D1Database, ids: number[]): Promise<Map<number, string>> {
-  const uniqueIds = [...new Set(ids)].filter((id) => Number.isFinite(id));
-  const usernameMap = new Map<number, string>();
-  if (uniqueIds.length === 0) return usernameMap;
-
-  for (const chunk of chunkValues(uniqueIds, 900)) {
-    const { results } = await db.prepare(
-      `SELECT id, username FROM user WHERE id IN (${createPlaceholders(chunk.length)})`
-    ).bind(...chunk).all<{ id: number; username: string }>();
-
-    for (const user of results) {
-      usernameMap.set(user.id, user.username);
-    }
-  }
-  return usernameMap;
-}
-
 async function getMemoReactions(db: D1Database, memoUid: string) {
   const reactions = await reactionDB.listReactions(db, memoUid);
-  const usernameMap = await resolveUsernamesByIds(db, reactions.map((r) => r.creator_id));
-  return reactions.map((r) => formatReaction(r, usernameMap.get(r.creator_id)));
+  return reactions.map((r) => formatReaction(r, r.creator_username));
 }
 
 function formatShare(share: shareDB.ShareRow, memoUid: string) {
@@ -284,10 +309,6 @@ async function enrichMemo(db: D1Database, memo: memoDB.MemoRow, creatorUsername?
   };
 }
 
-async function resolveCreatorUsernames(db: D1Database, memos: memoDB.MemoRow[]): Promise<Map<number, string>> {
-  return resolveUsernamesByIds(db, memos.map((m) => m.creator_id));
-}
-
 async function listAttachmentRowsByMemoIds(db: D1Database, memoIds: number[]) {
   const rows: any[] = [];
   for (const chunk of chunkValues(memoIds, 900)) {
@@ -299,13 +320,49 @@ async function listAttachmentRowsByMemoIds(db: D1Database, memoIds: number[]) {
   return rows;
 }
 
-async function listRelationRowsByMemoIds(db: D1Database, memoIds: number[]) {
-  const rows: relationDB.RelationRow[] = [];
-  for (const chunk of chunkValues(memoIds, 450)) {
+type MemoRefFields = Pick<memoDB.MemoRow, "uid" | "content" | "visibility" | "creator_id">;
+
+interface RelationWithMemoRow {
+  memo_id: number;
+  related_memo_id: number;
+  type: string;
+  memo_uid: string;
+  memo_content: string;
+  memo_visibility: string;
+  memo_creator_id: number;
+  related_uid: string;
+  related_content: string;
+  related_visibility: string;
+  related_creator_id: number;
+}
+
+function relationMemoRef(row: RelationWithMemoRow, side: "memo" | "related"): MemoRefFields {
+  return side === "memo"
+    ? { uid: row.memo_uid, content: row.memo_content, visibility: row.memo_visibility, creator_id: row.memo_creator_id }
+    : { uid: row.related_uid, content: row.related_content, visibility: row.related_visibility, creator_id: row.related_creator_id };
+}
+
+/** Load relations together with both endpoint memos in a single query. */
+async function listRelationsWithMemoByMemoIds(db: D1Database, memoIds: number[]): Promise<RelationWithMemoRow[]> {
+  const rows: RelationWithMemoRow[] = [];
+  const uniqueIds = [...new Set(memoIds)];
+  if (uniqueIds.length === 0) {
+    return rows;
+  }
+
+  for (const chunk of chunkValues(uniqueIds, 450)) {
     const placeholders = createPlaceholders(chunk.length);
     const { results } = await db.prepare(
-      `SELECT * FROM memo_relation WHERE memo_id IN (${placeholders}) OR related_memo_id IN (${placeholders})`
-    ).bind(...chunk, ...chunk).all<relationDB.RelationRow>();
+      `SELECT r.type, r.memo_id, r.related_memo_id,
+              source.uid AS memo_uid, source.content AS memo_content,
+              source.visibility AS memo_visibility, source.creator_id AS memo_creator_id,
+              target.uid AS related_uid, target.content AS related_content,
+              target.visibility AS related_visibility, target.creator_id AS related_creator_id
+       FROM memo_relation r
+       JOIN memo source ON source.id = r.memo_id
+       JOIN memo target ON target.id = r.related_memo_id
+       WHERE r.memo_id IN (${placeholders}) OR r.related_memo_id IN (${placeholders})`
+    ).bind(...chunk, ...chunk).all<RelationWithMemoRow>();
     rows.push(...results);
   }
   return rows;
@@ -315,29 +372,14 @@ async function listReactionRowsByContentIds(db: D1Database, contentIds: string[]
   const rows: reactionDB.ReactionRow[] = [];
   for (const chunk of chunkValues(contentIds, 900)) {
     const { results } = await db.prepare(
-      `SELECT * FROM reaction WHERE content_id IN (${createPlaceholders(chunk.length)}) ORDER BY content_id ASC, created_ts ASC`
+      `SELECT reaction.*, user.username AS creator_username
+       FROM reaction LEFT JOIN user ON user.id = reaction.creator_id
+       WHERE reaction.content_id IN (${createPlaceholders(chunk.length)})
+       ORDER BY reaction.content_id ASC, reaction.created_ts ASC`
     ).bind(...chunk).all<reactionDB.ReactionRow>();
     rows.push(...results);
   }
   return rows;
-}
-
-async function getMemoSnippetMapByIds(db: D1Database, memoIds: number[]) {
-  const memoMap = new Map<number, Pick<memoDB.MemoRow, "uid" | "content" | "visibility" | "creator_id">>();
-  const uniqueIds = [...new Set(memoIds)];
-  if (uniqueIds.length === 0) {
-    return memoMap;
-  }
-
-  for (const chunk of chunkValues(uniqueIds, 900)) {
-    const { results } = await db.prepare(
-      `SELECT id, uid, content, visibility, creator_id FROM memo WHERE id IN (${createPlaceholders(chunk.length)})`
-    ).bind(...chunk).all<memoDB.MemoRow>();
-    for (const memo of results) {
-      memoMap.set(memo.id, memo);
-    }
-  }
-  return memoMap;
 }
 
 async function getMemoRowMapByIds(db: D1Database, memoIds: number[]) {
@@ -349,7 +391,9 @@ async function getMemoRowMapByIds(db: D1Database, memoIds: number[]) {
 
   for (const chunk of chunkValues(uniqueIds, 900)) {
     const { results } = await db.prepare(
-      `SELECT * FROM memo WHERE id IN (${createPlaceholders(chunk.length)})`
+      `SELECT memo.*, user.username AS creator_username
+       FROM memo LEFT JOIN user ON user.id = memo.creator_id
+       WHERE memo.id IN (${createPlaceholders(chunk.length)})`
     ).bind(...chunk).all<memoDB.MemoRow>();
     for (const memo of results) {
       memoMap.set(memo.id, memo);
@@ -358,7 +402,7 @@ async function getMemoRowMapByIds(db: D1Database, memoIds: number[]) {
   return memoMap;
 }
 
-async function enrichMemos(db: D1Database, memos: memoDB.MemoRow[], creatorUsernameMap?: Map<number, string>, user?: UserPayload) {
+async function enrichMemos(db: D1Database, memos: memoDB.MemoRow[], user?: UserPayload) {
   if (memos.length === 0) {
     return [];
   }
@@ -374,7 +418,7 @@ async function enrichMemos(db: D1Database, memos: memoDB.MemoRow[], creatorUsern
     reactionRows,
   ] = await Promise.all([
     listAttachmentRowsByMemoIds(db, memoIds),
-    listRelationRowsByMemoIds(db, memoIds),
+    listRelationsWithMemoByMemoIds(db, memoIds),
     listReactionRowsByContentIds(db, memoUids),
   ]);
 
@@ -387,16 +431,11 @@ async function enrichMemos(db: D1Database, memos: memoDB.MemoRow[], creatorUsern
     attachmentsByMemoId.set(att.memo_id, attachments);
   }
 
-  const relationMemoIds = relationRows.flatMap((relation) => [relation.memo_id, relation.related_memo_id]);
-  const relationMemoMap = await getMemoSnippetMapByIds(db, relationMemoIds);
-
   const relationsByMemoId = new Map<number, any[]>();
   for (const relation of relationRows) {
-    const memo = relationMemoMap.get(relation.memo_id);
-    const relatedMemo = relationMemoMap.get(relation.related_memo_id);
     const formattedRelation = {
-      memo: formatMemoRelationSnippet(memo, user),
-      relatedMemo: formatMemoRelationSnippet(relatedMemo, user),
+      memo: formatMemoRelationSnippet(relationMemoRef(relation, "memo"), user),
+      relatedMemo: formatMemoRelationSnippet(relationMemoRef(relation, "related"), user),
       type: relation.type,
     };
     if (!formattedRelation.memo || !formattedRelation.relatedMemo) {
@@ -415,16 +454,15 @@ async function enrichMemos(db: D1Database, memos: memoDB.MemoRow[], creatorUsern
     }
   }
 
-  const reactionUsernameMap = await resolveUsernamesByIds(db, reactionRows.map((r) => r.creator_id));
   const reactionsByContentId = new Map<string, ReturnType<typeof formatReaction>[]>();
   for (const reaction of reactionRows) {
     const reactions = reactionsByContentId.get(reaction.content_id) || [];
-    reactions.push(formatReaction(reaction, reactionUsernameMap.get(reaction.creator_id)));
+    reactions.push(formatReaction(reaction, reaction.creator_username));
     reactionsByContentId.set(reaction.content_id, reactions);
   }
 
   return memos.map((memo) => ({
-    ...formatMemo(memo, creatorUsernameMap?.get(memo.creator_id)),
+    ...formatMemo(memo),
     attachments: attachmentsByMemoId.get(memo.id) || [],
     relations: relationsByMemoId.get(memo.id) || [],
     reactions: reactionsByContentId.get(memo.uid) || [],
@@ -475,6 +513,138 @@ function getAttachmentReference(value: unknown): string {
   return "";
 }
 
+const HTML_ENTITIES: Record<string, string> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  nbsp: " ",
+};
+
+function decodeHtmlEntities(value: string): string {
+  return value
+    .replace(/&#x([0-9a-f]+);/gi, (match, hex: string) => {
+      const code = parseInt(hex, 16);
+      return code <= 0x10ffff ? String.fromCodePoint(code) : match;
+    })
+    .replace(/&#(\d+);/g, (match, dec: string) => {
+      const code = parseInt(dec, 10);
+      return code <= 0x10ffff ? String.fromCodePoint(code) : match;
+    })
+    .replace(/&([a-z]+);/gi, (match, name: string) => HTML_ENTITIES[name.toLowerCase()] ?? match);
+}
+
+function parseMetaTags(html: string): Map<string, string> {
+  const metaMap = new Map<string, string>();
+  const metaRegex = /<meta\s+([^>]*?)\s*\/?>/gi;
+  let metaMatch: RegExpExecArray | null;
+  while ((metaMatch = metaRegex.exec(html)) !== null) {
+    const attributes: Record<string, string> = {};
+    const attributeRegex = /([a-zA-Z:_-]+)\s*=\s*("([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
+    let attributeMatch: RegExpExecArray | null;
+    while ((attributeMatch = attributeRegex.exec(metaMatch[1])) !== null) {
+      attributes[attributeMatch[1].toLowerCase()] = attributeMatch[3] ?? attributeMatch[4] ?? attributeMatch[5] ?? "";
+    }
+
+    const key = (attributes.property || attributes.name || "").trim().toLowerCase();
+    if (key && attributes.content && !metaMap.has(key)) {
+      metaMap.set(key, decodeHtmlEntities(attributes.content).trim());
+    }
+  }
+  return metaMap;
+}
+
+async function readResponseTextLimited(resp: Response, maxBytes: number): Promise<string> {
+  if (!resp.body) {
+    return "";
+  }
+
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      if (total + value.byteLength > maxBytes) {
+        chunks.push(value.slice(0, maxBytes - total));
+        total = maxBytes;
+        break;
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder("utf-8").decode(merged);
+}
+
+async function fetchLinkMetadataHtml(url: string): Promise<string | undefined> {
+  let currentUrl = url;
+  for (let redirectCount = 0; redirectCount <= MAX_LINK_METADATA_REDIRECTS; redirectCount++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LINK_METADATA_TIMEOUT_MS);
+    let resp: Response;
+    try {
+      resp = await fetch(currentUrl, {
+        headers: { "User-Agent": "cfmemos-bot/1.0", Accept: "text/html,application/xhtml+xml" },
+        redirect: "manual",
+        signal: controller.signal,
+      });
+    } catch {
+      return undefined;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (resp.status >= 300 && resp.status < 400) {
+      const location = resp.headers.get("location");
+      if (!location) {
+        return undefined;
+      }
+      let nextUrl: string | undefined;
+      try {
+        nextUrl = normalizeLinkMetadataUrl(new URL(location, currentUrl).toString());
+      } catch {
+        return undefined;
+      }
+      if (!nextUrl) {
+        return undefined;
+      }
+      currentUrl = nextUrl;
+      continue;
+    }
+
+    if (!resp.ok) {
+      return undefined;
+    }
+
+    const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+    if (!contentType.includes("text/html") && !contentType.includes("application/xhtml+xml")) {
+      return undefined;
+    }
+
+    const declaredLength = Number(resp.headers.get("content-length") || 0);
+    if (declaredLength > MAX_LINK_METADATA_BYTES) {
+      return undefined;
+    }
+
+    return await readResponseTextLimited(resp, MAX_LINK_METADATA_BYTES);
+  }
+
+  return undefined;
+}
+
 async function getLinkMetadata(env: Env, url: string, includeUrl = false): Promise<LinkMetadata> {
   const cacheKey = `link-metadata:${await sha256Hex(url)}`;
   const cached = await getCachedJson<LinkMetadata>(env.CACHE, cacheKey);
@@ -484,21 +654,30 @@ async function getLinkMetadata(env: Env, url: string, includeUrl = false): Promi
 
   let metadata: LinkMetadata;
   try {
-    const resp = await fetch(url, {
-      headers: { "User-Agent": "cfmemos-bot/1.0" },
-      redirect: "follow",
-    });
-    const html = await resp.text();
+    const html = await fetchLinkMetadataHtml(url);
+    if (!html) {
+      metadata = { title: "", description: "", image: "" };
+    } else {
+      const metaTags = parseMetaTags(html);
+      const titleTag = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "";
+      const title = (metaTags.get("og:title") || metaTags.get("twitter:title") || decodeHtmlEntities(titleTag)).trim();
+      const description = (metaTags.get("og:description") || metaTags.get("description") || metaTags.get("twitter:description") || "").trim();
+      let image = (metaTags.get("og:image") || metaTags.get("og:image:url") || metaTags.get("twitter:image") || "").trim();
 
-    const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
-    const descMatch = html.match(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']+)["']/i);
-    const imageMatch = html.match(/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i);
+      if (image) {
+        try {
+          image = new URL(image, url).toString();
+        } catch {
+          image = "";
+        }
+      }
 
-    metadata = {
-      title: titleMatch?.[1]?.trim() || "",
-      description: descMatch?.[1]?.trim() || "",
-      image: imageMatch?.[1]?.trim() || "",
-    };
+      metadata = {
+        title: title.slice(0, 300),
+        description: description.slice(0, 1000),
+        image: image.slice(0, MAX_LINK_METADATA_URL_LENGTH),
+      };
+    }
   } catch {
     metadata = { title: "", description: "", image: "" };
   }
@@ -567,19 +746,19 @@ async function resolveAttachmentIds(db: D1Database, user: UserPayload, reference
 async function setMemoAttachments(db: D1Database, memoId: number, user: UserPayload, references: unknown[]) {
   const attachmentIds = await resolveAttachmentIds(db, user, references);
 
-  await db.prepare("UPDATE attachment SET memo_id = NULL WHERE memo_id = ?").bind(memoId).run();
-  if (attachmentIds.length === 0) {
-    return;
-  }
-
+  const statements: D1PreparedStatement[] = [
+    db.prepare("UPDATE attachment SET memo_id = NULL WHERE memo_id = ?").bind(memoId),
+  ];
   for (const chunk of chunkValues(attachmentIds, 900)) {
     const placeholders = createPlaceholders(chunk.length);
-    if (user.role === "ADMIN") {
-      await db.prepare(`UPDATE attachment SET memo_id = ? WHERE id IN (${placeholders})`).bind(memoId, ...chunk).run();
-    } else {
-      await db.prepare(`UPDATE attachment SET memo_id = ? WHERE id IN (${placeholders}) AND creator_id = ?`).bind(memoId, ...chunk, user.id).run();
-    }
+    statements.push(
+      user.role === "ADMIN"
+        ? db.prepare(`UPDATE attachment SET memo_id = ? WHERE id IN (${placeholders})`).bind(memoId, ...chunk)
+        : db.prepare(`UPDATE attachment SET memo_id = ? WHERE id IN (${placeholders}) AND creator_id = ?`).bind(memoId, ...chunk, user.id),
+    );
   }
+
+  await db.batch(statements);
 }
 
 // Create memo
@@ -637,7 +816,7 @@ memoRoutes.post("/", authRequired, async (c) => {
 // List memos
 memoRoutes.get("/", authOptional, async (c) => {
   const user = c.get("user");
-  const pageSize = Math.min(Number(c.req.query("pageSize")) || 50, 1000);
+  const pageSize = Math.max(1, Math.min(Number(c.req.query("pageSize")) || 50, 1000));
   const pageToken = c.req.query("pageToken");
   const filter = c.req.query("filter") || "";
   const orderBy = c.req.query("orderBy") || "";
@@ -646,7 +825,16 @@ memoRoutes.get("/", authOptional, async (c) => {
   let offset = 0;
   if (pageToken) {
     try {
-      offset = Number(atob(pageToken));
+      const decoded = atob(pageToken);
+      const numericOffset = Number(decoded);
+      if (Number.isFinite(numericOffset)) {
+        offset = Math.max(0, Math.trunc(numericOffset));
+      } else {
+        const parsed = JSON.parse(decoded) as { offset?: unknown };
+        if (typeof parsed.offset === "number" && Number.isFinite(parsed.offset)) {
+          offset = Math.max(0, Math.trunc(parsed.offset));
+        }
+      }
     } catch { /* invalid token, start from 0 */ }
   }
 
@@ -681,16 +869,13 @@ memoRoutes.get("/", authOptional, async (c) => {
     opts.readableByUserId = user.id;
   }
 
-  const { memos, total } = await memoDB.listMemos(c.env.DB, opts);
+  const { memos, hasNext } = await memoDB.listMemos(c.env.DB, opts);
 
-  const nextPageToken = offset + pageSize < total ? btoa(String(offset + pageSize)) : "";
-
-  const usernameMap = await resolveCreatorUsernames(c.env.DB, memos);
+  const nextPageToken = hasNext ? btoa(String(offset + pageSize)) : "";
 
   return c.json({
-    memos: await enrichMemos(c.env.DB, memos, usernameMap, user),
+    memos: await enrichMemos(c.env.DB, memos, user),
     nextPageToken,
-    totalSize: total,
   });
 });
 
@@ -715,8 +900,7 @@ memoRoutes.get("/:id", authOptional, async (c) => {
     return c.json({ error: getMemoReadErrorMessage(deniedStatus) }, deniedStatus);
   }
 
-  const creatorUser = await c.env.DB.prepare("SELECT username FROM user WHERE id = ?").bind(memo.creator_id).first<{ username: string }>();
-  return c.json(await enrichMemo(c.env.DB, memo, creatorUser?.username, user));
+  return c.json(await enrichMemo(c.env.DB, memo, memo.creator_username, user));
 });
 
 // Update memo
@@ -780,7 +964,7 @@ memoRoutes.patch("/:id", authRequired, async (c) => {
     return c.json({ error: "Update failed" }, 500);
   }
 
-  const creatorName = updated.creator_id === user.id ? user.username : (await c.env.DB.prepare("SELECT username FROM user WHERE id = ?").bind(updated.creator_id).first<{ username: string }>())?.username;
+  const creatorName = memo.creator_username || (updated.creator_id === user.id ? user.username : undefined);
   await invalidateMemoDerivedCaches(c.env.CACHE, [creatorName]);
   const enrichedMemo = await enrichMemo(c.env.DB, updated, creatorName, user);
   enqueueMemoWebhook(c, "memo.updated", updated.creator_id, enrichedMemo, user);
@@ -806,18 +990,47 @@ memoRoutes.delete("/:id", authRequired, async (c) => {
     return c.json({ error: "Permission denied" }, 403);
   }
 
-  const creatorName = memo.creator_id === user.id ? user.username : (await c.env.DB.prepare("SELECT username FROM user WHERE id = ?").bind(memo.creator_id).first<{ username: string }>())?.username;
+  const creatorName = memo.creator_username || (memo.creator_id === user.id ? user.username : undefined);
   const deletedMemo = await enrichMemo(c.env.DB, memo, creatorName, user);
 
-  const { results: memoAttachments } = await c.env.DB.prepare(
-    "SELECT id, reference, storage_type FROM attachment WHERE memo_id = ?"
-  ).bind(memo.id).all<{ id: number; reference: string; storage_type: string }>();
-  if (memoAttachments.length > 0) {
-    await deleteStoredObjects(c.env, c.env.DB, memoAttachments);
-    await c.env.DB.prepare("DELETE FROM attachment WHERE memo_id = ?").bind(memo.id).run();
+  // Delete the memo together with its comment subtree and all derived rows.
+  // R2/S3 blobs are removed first, then the database rows are cleaned in one
+  // D1 batch per chunk to keep the operation atomic and fast.
+  const memoIds = await collectCommentTree(c.env.DB, memo.id);
+  for (const chunk of chunkValues(memoIds, 400)) {
+    const memoPlaceholders = createPlaceholders(chunk.length);
+
+    const { results: uidRows } = await c.env.DB.prepare(
+      `SELECT uid FROM memo WHERE id IN (${memoPlaceholders})`
+    ).bind(...chunk).all<{ uid: string }>();
+    const contentIds = uidRows.map((row) => row.uid);
+
+    const { results: memoAttachments } = await c.env.DB.prepare(
+      `SELECT id, reference, storage_type FROM attachment WHERE memo_id IN (${memoPlaceholders})`
+    ).bind(...chunk).all<{ id: number; reference: string; storage_type: string }>();
+    if (memoAttachments.length > 0) {
+      await deleteStoredObjects(c.env, c.env.DB, memoAttachments);
+    }
+
+    const statements: D1PreparedStatement[] = [];
+    if (contentIds.length > 0) {
+      statements.push(
+        c.env.DB.prepare(
+          `DELETE FROM reaction WHERE content_id IN (${createPlaceholders(contentIds.length)})`
+        ).bind(...contentIds),
+      );
+    }
+    statements.push(
+      c.env.DB.prepare(`DELETE FROM memo_share WHERE memo_id IN (${memoPlaceholders})`).bind(...chunk),
+      c.env.DB.prepare(
+        `DELETE FROM memo_relation WHERE memo_id IN (${memoPlaceholders}) OR related_memo_id IN (${memoPlaceholders})`
+      ).bind(...chunk, ...chunk),
+      c.env.DB.prepare(`DELETE FROM attachment WHERE memo_id IN (${memoPlaceholders})`).bind(...chunk),
+      c.env.DB.prepare(`DELETE FROM memo WHERE id IN (${memoPlaceholders})`).bind(...chunk),
+    );
+    await c.env.DB.batch(statements);
   }
 
-  await memoDB.deleteMemo(c.env.DB, memo.id);
   await invalidateMemoDerivedCaches(c.env.CACHE, [creatorName]);
   enqueueMemoWebhook(c, "memo.deleted", memo.creator_id, deletedMemo, user);
   return c.json({});
@@ -836,22 +1049,8 @@ memoRoutes.get("/:id/relations", authOptional, async (c) => {
     return c.json({ error: getMemoReadErrorMessage(deniedStatus) }, deniedStatus);
   }
 
-  const relations = await relationDB.listRelations(c.env.DB, memo.id);
-  const otherMemoIds = relations.map((relation) => relation.memo_id === memo.id ? relation.related_memo_id : relation.memo_id);
-  const otherMemoMap = await getMemoSnippetMapByIds(c.env.DB, otherMemoIds);
-  const visibleRelations: Array<{ memo?: { name: string; snippet: string }; relatedMemo?: { name: string; snippet: string }; type: string }> = [];
-  for (const relation of relations) {
-    const otherMemoId = relation.memo_id === memo.id ? relation.related_memo_id : relation.memo_id;
-    const otherMemo = otherMemoMap.get(otherMemoId);
-    if (!otherMemo || !getMemoReadDeniedStatus(otherMemo, user)) {
-      const memoRef = formatMemoRelationSnippet(otherMemoMap.get(relation.memo_id), user);
-      const relatedMemoRef = formatMemoRelationSnippet(otherMemoMap.get(relation.related_memo_id), user);
-      if (memoRef && relatedMemoRef) {
-        visibleRelations.push({ memo: memoRef, relatedMemo: relatedMemoRef, type: relation.type });
-      }
-    }
-  }
-  return c.json({ relations: visibleRelations, nextPageToken: "" });
+  const relations = await getMemoRelations(c.env.DB, memo.id, user);
+  return c.json({ relations, nextPageToken: "" });
 });
 
 function normalizeRelationType(value: unknown): string {
@@ -988,9 +1187,8 @@ memoRoutes.get("/:id/comments", authOptional, async (c) => {
     if (comment && !getMemoReadDeniedStatus(comment, user)) comments.push(comment);
   }
 
-  const usernameMap = await resolveCreatorUsernames(c.env.DB, comments);
   return c.json({
-    memos: await enrichMemos(c.env.DB, comments, usernameMap, user),
+    memos: await enrichMemos(c.env.DB, comments, user),
     nextPageToken: "",
     totalSize: comments.length,
   });
@@ -1185,6 +1383,5 @@ shareRoutes.get("/shares/:shareId", authOptional, async (c) => {
     return c.json({ error: "Memo not found" }, 404);
   }
 
-  const creatorUser = await c.env.DB.prepare("SELECT username FROM user WHERE id = ?").bind(memo.creator_id).first<{ username: string }>();
-  return c.json(await enrichMemo(c.env.DB, memo, creatorUser?.username));
+  return c.json(await enrichMemo(c.env.DB, memo, memo.creator_username));
 });

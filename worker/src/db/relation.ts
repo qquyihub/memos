@@ -40,18 +40,21 @@ export async function setRelations(
   memoId: number,
   relations: { relatedMemoId: number; type: string }[]
 ): Promise<void> {
-  await db.prepare("DELETE FROM memo_relation WHERE memo_id = ?").bind(memoId).run();
-  if (relations.length === 0) {
-    return;
-  }
+  const statements: D1PreparedStatement[] = [
+    db.prepare("DELETE FROM memo_relation WHERE memo_id = ?").bind(memoId),
+  ];
 
   for (const chunk of chunkValues(relations, 300)) {
     const placeholders = chunk.map(() => "(?, ?, ?)").join(", ");
     const params = chunk.flatMap((rel) => [memoId, rel.relatedMemoId, rel.type]);
-    await db.prepare(
-      `INSERT OR IGNORE INTO memo_relation (memo_id, related_memo_id, type) VALUES ${placeholders}`
-    ).bind(...params).run();
+    statements.push(
+      db.prepare(
+        `INSERT OR IGNORE INTO memo_relation (memo_id, related_memo_id, type) VALUES ${placeholders}`
+      ).bind(...params),
+    );
   }
+
+  await db.batch(statements);
 }
 
 export async function deleteRelation(

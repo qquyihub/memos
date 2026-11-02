@@ -9,6 +9,7 @@ export interface MemoRow {
   visibility: string;
   pinned: number;
   payload: string;
+  creator_username?: string;
 }
 
 export interface ListMemosOpts {
@@ -62,65 +63,68 @@ export async function createMemo(
   return (await db.prepare(query).bind(...params).first<MemoRow>())!;
 }
 
+const MEMO_SELECT = `SELECT memo.*, user.username AS creator_username
+  FROM memo LEFT JOIN user ON user.id = memo.creator_id`;
+
 export async function getMemoByUid(
   db: D1Database,
   uid: string
 ): Promise<MemoRow | null> {
-  return db.prepare("SELECT * FROM memo WHERE uid = ?").bind(uid).first<MemoRow>();
+  return db.prepare(`${MEMO_SELECT} WHERE memo.uid = ?`).bind(uid).first<MemoRow>();
 }
 
 export async function getMemoById(
   db: D1Database,
   id: number
 ): Promise<MemoRow | null> {
-  return db.prepare("SELECT * FROM memo WHERE id = ?").bind(id).first<MemoRow>();
+  return db.prepare(`${MEMO_SELECT} WHERE memo.id = ?`).bind(id).first<MemoRow>();
 }
 
 export async function listMemos(
   db: D1Database,
   opts: ListMemosOpts
-): Promise<{ memos: MemoRow[]; total: number }> {
+): Promise<{ memos: MemoRow[]; hasNext: boolean }> {
   const conditions: string[] = [];
   const params: (string | number)[] = [];
 
   if (opts.creatorId !== undefined) {
-    conditions.push("creator_id = ?");
+    conditions.push("memo.creator_id = ?");
     params.push(opts.creatorId);
   }
   if (opts.rowStatus) {
-    conditions.push("row_status = ?");
+    conditions.push("memo.row_status = ?");
     params.push(opts.rowStatus);
   }
   if (opts.visibility) {
-    conditions.push("visibility = ?");
+    conditions.push("memo.visibility = ?");
     params.push(opts.visibility);
   }
   if (opts.visibilities && opts.visibilities.length > 0) {
     const placeholders = opts.visibilities.map(() => "?").join(", ");
-    conditions.push(`visibility IN (${placeholders})`);
+    conditions.push(`memo.visibility IN (${placeholders})`);
     params.push(...opts.visibilities);
   }
   if (opts.pinned !== undefined) {
-    conditions.push("pinned = ?");
+    conditions.push("memo.pinned = ?");
     params.push(opts.pinned ? 1 : 0);
   }
   if (opts.excludeComments) {
-    conditions.push("json_extract(payload, '$.parent') IS NULL");
+    conditions.push("json_extract(memo.payload, '$.parent') IS NULL");
   }
   if (opts.contentSearch) {
-    conditions.push("content LIKE ?");
+    conditions.push("memo.content LIKE ?");
     params.push(`%${opts.contentSearch}%`);
   }
   if (opts.tagSearch) {
-    conditions.push("payload LIKE ?");
+    conditions.push("memo.payload LIKE ?");
     params.push(`%${opts.tagSearch}%`);
   }
   if (opts.createdTsAfter !== undefined) {
-    conditions.push("created_ts >= ?");
+    conditions.push("memo.created_ts >= ?");
     params.push(opts.createdTsAfter);
   }
   if (opts.createdTsBefore !== undefined) {
-    conditions.push("created_ts < ?");
+    conditions.push("memo.created_ts < ?");
     params.push(opts.createdTsBefore);
   }
   if (opts.filterWhere) {
@@ -128,41 +132,44 @@ export async function listMemos(
     params.push(...(opts.filterParams || []));
   }
   if (opts.readableByUserId !== undefined) {
-    conditions.push("(visibility IN ('PUBLIC', 'PROTECTED') OR creator_id = ?)");
+    conditions.push("(memo.visibility IN ('PUBLIC', 'PROTECTED') OR memo.creator_id = ?)");
     params.push(opts.readableByUserId);
   }
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
-  const countQuery = `SELECT COUNT(*) as total FROM memo ${where}`;
-  const countResult = await db.prepare(countQuery).bind(...params).first<{ total: number }>();
-  const total = countResult?.total ?? 0;
-
-  let orderClause = "ORDER BY pinned DESC, created_ts DESC";
+  const allowedOrderColumns = new Set(["id", "created_ts", "updated_ts", "pinned"]);
+  const orderParts: string[] = [];
   if (opts.orderBy) {
-    const allowedOrderColumns = new Set(["id", "created_ts", "updated_ts", "pinned"]);
     const parts = opts.orderBy.split(",").map((p) => p.trim());
-    const orderParts: string[] = [];
     for (const part of parts) {
       const [field, dir] = part.split(" ");
       const col = field === "create_time" ? "created_ts" : field === "update_time" ? "updated_ts" : field;
       if (allowedOrderColumns.has(col)) {
-        orderParts.push(`${col} ${dir?.toUpperCase() === "ASC" ? "ASC" : "DESC"}`);
+        orderParts.push(`memo.${col} ${dir?.toUpperCase() === "ASC" ? "ASC" : "DESC"}`);
       }
     }
-    if (orderParts.length > 0) {
-      orderClause = `ORDER BY ${orderParts.join(", ")}`;
-    }
   }
+  if (orderParts.length === 0) {
+    orderParts.push("memo.pinned DESC", "memo.created_ts DESC");
+  }
+  // Stable ordering for pagination when timestamps tie.
+  if (!orderParts.some((part) => part.startsWith("memo.id "))) {
+    orderParts.push("memo.id DESC");
+  }
+  const orderClause = `ORDER BY ${orderParts.join(", ")}`;
 
-  const pageSize = opts.pageSize || 50;
-  const offset = opts.offset || 0;
+  const pageSize = Math.max(1, Math.min(Math.trunc(opts.pageSize ?? 50), 1000));
+  const offset = Math.max(0, Math.trunc(opts.offset ?? 0));
 
-  const dataQuery = `SELECT * FROM memo ${where} ${orderClause} LIMIT ? OFFSET ?`;
-  const allParams = [...params, pageSize, offset];
-  const { results } = await db.prepare(dataQuery).bind(...allParams).all<MemoRow>();
+  // Fetch one extra row instead of running a COUNT(*) over the filtered set.
+  // Counting was the dominant D1 cost for large memo lists and the API only
+  // needs to know whether another page exists.
+  const dataQuery = `${MEMO_SELECT} ${where} ${orderClause} LIMIT ? OFFSET ?`;
+  const { results } = await db.prepare(dataQuery).bind(...params, pageSize + 1, offset).all<MemoRow>();
 
-  return { memos: results, total };
+  const hasNext = results.length > pageSize;
+  return { memos: hasNext ? results.slice(0, pageSize) : results, hasNext };
 }
 
 export async function updateMemo(
@@ -199,6 +206,3 @@ export async function updateMemo(
   return db.prepare(query).bind(...values).first<MemoRow>();
 }
 
-export async function deleteMemo(db: D1Database, id: number): Promise<void> {
-  await db.prepare("DELETE FROM memo WHERE id = ?").bind(id).run();
-}
