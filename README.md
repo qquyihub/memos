@@ -22,67 +22,71 @@
 
 ## 快速部署
 
-### 1. 克隆仓库
+### 方式一：一键自动创建、绑定、初始化（推荐）
+
+前置要求：Node.js >= 18，并已完成 Cloudflare 认证：
+
+```bash
+npx wrangler login
+# 或在 CI 中设置 CLOUDFLARE_API_TOKEN 与 CLOUDFLARE_ACCOUNT_ID
+```
 
 ```bash
 git clone https://github.com/jkjoy/memos-on-cloudflare.git
 cd memos-on-cloudflare
-```
 
-### 2. 安装依赖
-
-```bash
 npm install
 cd web && npm install && cd ..
+
+npm run cf:doctor   # 检查账号、资源与配置
+npm run cf:setup    # 查找或创建 D1 / R2，生成 wrangler.local.toml
+npm run cf:init     # 对远程 D1 应用 migrations
+npm run cf:deploy   # 构建前端 + 迁移 + 写入 JWT_SECRET + 部署
 ```
 
-### 3. 创建 Cloudflare 资源
+`npm run deploy` 等价于一次执行 `setup → build → init → deploy`。
+
+脚本会：
+
+- 按名称 `cfmemos-db` 与 `memos` 查找 D1 / R2；不存在时自动创建，已存在时复用；
+- 将真实资源 ID 只写入 Git 忽略的 `wrangler.local.toml`，不污染仓库；
+- 优先使用 `JWT_SECRET` 环境变量，其次读取 `.dev.vars`，最后自动生成随机值并写入 `.dev.vars`；
+- 仅在远程 Worker 尚无 `JWT_SECRET` 时写入 Secret，重复部署不会轮换密钥；
+- 幂等，可反复执行。
+
+可通过 `CFMEMOS_D1_NAME`、`CFMEMOS_R2_BUCKET` 覆盖资源名称。
+
+### 方式二：Cloudflare 控制台导入 Git 仓库
+
+适合在 Cloudflare 上直接新建项目：
+
+1. Fork 本仓库；
+2. 进入 **Workers & Pages → Create application → Import a repository**，选择 Fork；
+3. Production branch 选择 `main`，Root directory 留空，Build command 填写 `npm install && cd web && npm install && npm run build`，Deploy command 填写 `node scripts/cloudflare-deploy.mjs deploy --skip-build`；
+4. 确认 Cloudflare 构建使用的 API Token 具备 **D1:Edit** 与 **R2:Edit** 权限。脚本会据此自动创建并绑定 `DB`、`BUCKET`；
+5. 在 Worker 的 **Settings → Variables and Secrets** 中确认存在 `JWT_SECRET`（脚本会自动生成，也可自行指定强随机值）；
+6. 部署完成后访问 Workers URL，首次访问会进入管理员注册页面。
+
+> 如果保留 Cloudflare 默认的 Deploy command `npx wrangler deploy`，Cloudflare 会依据 `wrangler.toml` 中无 ID 的声明自动创建并绑定 D1 / R2，但不会执行数据库迁移。此时需要在首次部署后额外运行一次 `npm run cf:init`（或使用方式三）。
+
+### 方式三：手动创建资源
 
 ```bash
 # 创建 D1 数据库
-wrangler d1 create cfmemos-db
+npx wrangler d1 create cfmemos-db
 
 # 创建 R2 存储桶
-wrangler r2 bucket create cfmemos
+npx wrangler r2 bucket create memos
+
+# 按名称找到上述资源，生成包含真实资源 ID 的 wrangler.local.toml
+npm run cf:setup
+
+# 初始化数据库
+npm run cf:init
+
+# 构建并部署（会自动生成并写入 JWT_SECRET）
+npm run cf:deploy
 ```
-
-### 4. 配置 wrangler.toml
-
-将第 3 步创建 D1 时返回的 `database_id` 填入 `wrangler.toml`：
-
-```toml
-[assets]
-directory = "./web/dist"
-binding = "ASSETS"
-not_found_handling = "single-page-application"
-run_worker_first = ["/api/*", "/file/*", "/u/*"]
-
-[[d1_databases]]
-binding = "DB"
-database_name = "cfmemos-db"
-database_id = "你的实际数据库ID"
-```
-
-### 5. 设置生产密钥
-
-```bash
-# 设置 JWT 密钥（务必使用强随机字符串）
-wrangler secret put JWT_SECRET
-```
-
-### 6. 初始化数据库
-
-```bash
-npm run db:migrate:remote
-```
-
-### 7. 构建并部署
-
-```bash
-npm run deploy
-```
-
-部署完成后，访问 Workers 分配的域名，首次访问会进入管理员注册页面。
 
 ## GitHub Actions 自动部署
 
@@ -92,8 +96,10 @@ npm run deploy
 |--------|------|
 | `CLOUDFLARE_API_TOKEN` | Cloudflare API Token（需要 Workers Scripts:Edit、D1:Edit、R2:Edit 权限） |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare Account ID（在 Dashboard 右侧栏可找到） |
+| `JWT_SECRET` | 可选。首次部署时写入；未配置时脚本会自动生成 |
 
-工作流会自动完成：安装依赖 → 构建前端 → 执行数据库迁移 → 部署 Worker。
+工作流会自动完成：安装依赖 → 构建前端 → 创建或复用 D1/R2 → 生成 `wrangler.local.toml` → 执行数据库迁移 → 写入 `JWT_SECRET` → 部署 Worker。
+
 
 ## 本地开发
 
@@ -113,8 +119,10 @@ npm run dev:web
 ## 项目结构
 
 ```
-├── wrangler.toml          # Cloudflare 配置（D1、R2、AI 绑定）
+├── wrangler.toml          # Cloudflare 配置（D1、R2、AI 绑定，不含真实资源 ID）
 ├── package.json           # 根 package，部署脚本
+├── scripts/
+│   └── cloudflare-deploy.mjs  # 自动创建/绑定/初始化/部署
 ├── migrations/
 │   └── 0001_initial.sql   # D1 数据库 schema
 ├── worker/
@@ -149,8 +157,10 @@ npm run dev:web
 
 | 变量 | 说明 | 必填 |
 |------|------|------|
-| `JWT_SECRET` | JWT 签名密钥，生产环境必须使用强随机字符串 | 是 |
+| `JWT_SECRET` | JWT 签名密钥；未设置时 `cf:deploy` 会自动生成 | 是 |
 | `INSTANCE_NAME` | 实例名称，显示在页面标题 | 否 |
+| `CFMEMOS_D1_NAME` | 自动创建/查找的 D1 数据库名称，默认 `cfmemos-db` | 否 |
+| `CFMEMOS_R2_BUCKET` | 自动创建/查找的 R2 存储桶名称，默认 `memos` | 否 |
 
 生产环境通过 `wrangler secret put` 设置敏感变量，非敏感变量在 `wrangler.toml` 的 `[vars]` 中配置。
 

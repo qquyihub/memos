@@ -6,9 +6,31 @@
     "dev": "wrangler dev",
     "dev:web": "cd web && npm run dev",
     "build:web": "cd web && npm run build",
-    "deploy": "npm run build:web && wrangler deploy",
+    "cf:doctor": "node scripts/cloudflare-deploy.mjs doctor",
+    "cf:setup": "node scripts/cloudflare-deploy.mjs setup",
+    "cf:init": "node scripts/cloudflare-deploy.mjs init",
+    "cf:deploy": "node scripts/cloudflare-deploy.mjs deploy",
+    "deploy": "node scripts/cloudflare-deploy.mjs deploy",
     "db:migrate": "wrangler d1 migrations apply cfmemos-db --local",
-    "db:migrate:remote": "wrangler d1 migrations apply cfmemos-db --remote"
+    "db:migrate:remote": "node scripts/cloudflare-deploy.mjs init"
+  },
+  "cloudflare": {
+    "label": "cfmemos",
+    "products": ["Workers", "D1", "R2", "AI"],
+    "bindings": {
+      "DB": {
+        "description": "D1 数据库，存储用户、备忘录、评论、设置等结构化数据；新项目首次部署时按 database_name 自动创建并绑定。"
+      },
+      "BUCKET": {
+        "description": "R2 存储桶，保存附件、图片和音频文件；新项目首次部署时按 bucket_name 自动创建并绑定。"
+      },
+      "AI": {
+        "description": "Workers AI 绑定，用于音频转写（@cf/openai/whisper）。"
+      },
+      "JWT_SECRET": {
+        "description": "JWT 签名密钥，必填。可通过 cf:deploy 自动生成，或设置为至少 32 位随机字符串。"
+      }
+    }
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

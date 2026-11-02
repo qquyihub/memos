@@ -1,7 +1,10 @@
 node_modules/
 dist/
 .wrangler/
+.wrangler.secrets.json
+wrangler.local.toml
 .dev.vars
 .env
+.env.local
 *.log
 .claude
