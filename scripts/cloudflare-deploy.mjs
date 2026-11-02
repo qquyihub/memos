@@ -48,6 +48,8 @@ const r2Enabled = parseFlag(process.env.CFMEMOS_ENABLE_R2);
 const kvEnabled = parseFlag(process.env.CFMEMOS_ENABLE_KV);
 const jwtSecretName = "JWT_SECRET";
 const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+// KV 命名空间 ID 是 32 位无连字符十六进制，与 D1 的 UUID 格式不同。
+const kvIdPattern = /\bid\s*=\s*"([0-9a-f]{32})"/i;
 
 if (!commands.has(command)) {
   console.error("用法: node scripts/cloudflare-deploy.mjs <doctor|setup|init|deploy> [--dry-run]");
@@ -290,10 +292,14 @@ const ensureKV = () => {
 
   const created = runWrangler(["kv", "namespace", "create", kvName]);
   const createdOutput = outputOf(created);
-  const createdId = createdOutput.match(uuidPattern)?.[0] ?? "";
-  if (created.status === 0 && createdId) {
-    ok("KV 命名空间", `已创建 ${kvName} (${createdId})`);
-    return createdId;
+  const createdId = createdOutput.match(kvIdPattern)?.[1] ?? "";
+  if (created.status === 0) {
+    // wrangler 不同版本的输出格式可能变化；解析不到时回查命名空间列表。
+    const namespaceId = createdId || findKvId();
+    if (namespaceId) {
+      ok("KV 命名空间", `已创建 ${kvName} (${namespaceId})`);
+      return namespaceId;
+    }
   }
 
   if (/already exists|已存在/i.test(createdOutput)) {
