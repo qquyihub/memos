@@ -17,13 +17,10 @@
   },
   "cloudflare": {
     "label": "cfmemos",
-    "products": ["Workers", "D1", "R2", "AI"],
+    "products": ["Workers", "D1", "AI"],
     "bindings": {
       "DB": {
         "description": "D1 数据库，存储用户、备忘录、评论、设置等结构化数据；新项目首次部署时按 database_name 自动创建并绑定。"
-      },
-      "BUCKET": {
-        "description": "R2 存储桶，保存附件、图片和音频文件；新项目首次部署时按 bucket_name 自动创建并绑定。"
       },
       "AI": {
         "description": "Workers AI 绑定，用于音频转写（@cf/openai/whisper）。"

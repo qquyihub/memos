@@ -1,6 +1,6 @@
 # Memos on Cloudflare
 
-将 [Memos](https://github.com/usememos/memos) 笔记应用完整迁移到 Cloudflare 边缘平台，使用 Workers + D1 + R2 替代原有的 Go + SQLite + 本地存储架构。
+将 [Memos](https://github.com/usememos/memos) 笔记应用完整迁移到 Cloudflare 边缘平台，使用 Workers + D1 替代原有的 Go + SQLite + 本地存储架构；R2 / KV 为可选资源，默认仅使用 D1。
 
 ## 技术栈
 
@@ -9,7 +9,7 @@
 | 运行时 | Cloudflare Workers |
 | 后端框架 | Hono |
 | 数据库 | Cloudflare D1 (SQLite) |
-| 文件存储 | Cloudflare R2 |
+| 文件存储 | Cloudflare R2（可选）/ S3 / WebDAV |
 | AI | Cloudflare Workers AI (Whisper) |
 | 前端 | React + Vite + TailwindCSS |
 | 认证 | JWT (HS256) + bcrypt |
@@ -18,7 +18,7 @@
 
 - [Node.js](https://nodejs.org/) >= 18
 - [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/) >= 4.14
-- Cloudflare 账号（已开通 Workers、D1、R2）
+- Cloudflare 账号（已开通 Workers、D1；R2 / KV 可选）
 
 ## 快速部署
 
@@ -39,7 +39,7 @@ npm install
 cd web && npm install && cd ..
 
 npm run cf:doctor   # 检查账号、资源与配置
-npm run cf:setup    # 查找或创建 D1 / R2，生成 wrangler.local.toml
+npm run cf:setup    # 查找或创建 D1（按需创建 R2 / KV），生成 wrangler.local.toml
 npm run cf:init     # 对远程 D1 应用 migrations
 npm run cf:deploy   # 构建前端 + 迁移 + 写入 JWT_SECRET + 部署
 ```
@@ -49,15 +49,17 @@ npm run cf:deploy   # 构建前端 + 迁移 + 写入 JWT_SECRET + 部署
 
 脚本会：
 
-- 按名称 `memos` 查找 D1 / R2；不存在时自动创建，已存在时复用；
+- 默认只查找或创建 D1 数据库；R2 / KV 默认不创建、不绑定；
+- 需要 R2 或 KV 时，设置 `CFMEMOS_ENABLE_R2=true` / `CFMEMOS_ENABLE_KV=true` 后再执行脚本；
+- D1 / R2 / KV 的资源名称均可通过变量覆盖，默认都是 `memos`；
 - 将真实资源 ID 只写入 Git 忽略的 `wrangler.local.toml`，不污染仓库；
 - 优先使用 `JWT_SECRET` 环境变量，其次读取 `.dev.vars`，最后自动生成随机值并写入 `.dev.vars`；
 - 仅在远程 Worker 尚无 `JWT_SECRET` 时写入 Secret，重复部署不会轮换密钥；
 - 幂等，可反复执行。
 
-可通过 `CFMEMOS_D1_NAME`、`CFMEMOS_R2_BUCKET`、`CFMEMOS_KV_NAME` 覆盖资源名称。
+可通过 `CFMEMOS_D1_NAME`、`CFMEMOS_R2_BUCKET`、`CFMEMOS_KV_NAME` 覆盖资源名称，三者默认都是 `memos`。
 
-默认不启用 KV。需要 KV 缓存时，在 `wrangler.toml` 中取消 `[[kv_namespaces]]` 与 `binding = "CACHE"` 两行的注释，再执行 `npm run cf:setup`；脚本会自动创建或复用 `cfmemos-cache` 命名空间，并把真实 `id` 写入 `wrangler.local.toml`。
+默认不启用 KV 与 R2，只需设置 `CFMEMOS_ENABLE_KV=true` 或 `CFMEMOS_ENABLE_R2=true` 即可开启；脚本会自动创建或复用对应资源，并把绑定写入 `wrangler.local.toml`。未启用 R2 时，附件存储可使用设置中的 S3 / WebDAV 后端。
 
 ### 方式二：Cloudflare 控制台导入 Git 仓库（推荐）
 
@@ -72,11 +74,11 @@ npm run cf:deploy   # 构建前端 + 迁移 + 写入 JWT_SECRET + 部署
 4. **API token**：不要使用 Cloudflare 自动生成的默认 Token。默认 Token 只包含 Workers Scripts / KV / R2 编辑权限，**不包含 D1 权限**，无法自动创建或绑定 D1。请先在 **My Profile → API Tokens → Create Token** 创建自定义 Token，至少包含：
    - Account → **Workers Scripts: Edit**
    - Account → **D1: Edit**
-   - Account → **Workers R2 Storage: Edit**
+   - Account → **Workers R2 Storage: Edit**（仅启用 R2 时需要）
    - Account → **Workers KV Storage: Edit**（仅启用 KV 时需要）
 
-   然后在 Build settings 的 **API token** 中选择该 Token；
-5. 保存并部署。`npm run cf:deploy` 会自动完成：构建前端生成 `web/dist` → 查找或创建 D1 `memos` / R2 `memos`（启用 KV 时创建 `cfmemos-cache`）→ 生成 `wrangler.local.toml` → 执行 D1 migrations → 首次部署时写入 `JWT_SECRET` → 部署 Worker；
+   然后在 Build settings 的 **API token** 中选择该 Token；如需启用 R2 / KV，在 Build settings 中添加环境变量 `CFMEMOS_ENABLE_R2=true` / `CFMEMOS_ENABLE_KV=true`（也可用 `CFMEMOS_D1_NAME`、`CFMEMOS_R2_BUCKET`、`CFMEMOS_KV_NAME` 改名）；
+5. 保存并部署。`npm run cf:deploy` 会自动完成：构建前端生成 `web/dist` → 查找或创建 D1 `memos`（启用 R2 / KV 时同时创建对应资源，默认名称均为 `memos`）→ 生成 `wrangler.local.toml` → 执行 D1 migrations → 首次部署时写入 `JWT_SECRET` → 部署 Worker；
 6. 部署完成后访问 Workers URL，首次访问会进入管理员注册页面。
 
 > 也可拆分为两步：Build command 填 `npm run build`，Deploy command 填 `npm run cf:deploy -- --skip-build`。
@@ -86,13 +88,14 @@ npm run cf:deploy   # 构建前端 + 迁移 + 写入 JWT_SECRET + 部署
 ### 方式三：手动创建资源
 
 ```bash
-# 创建 D1 数据库
+# 创建 D1 数据库（默认名称 memos）
 npx wrangler d1 create memos
 
-# 创建 R2 存储桶
+# 可选：启用 R2 时创建存储桶
 npx wrangler r2 bucket create memos
 
 # 按名称找到上述资源，生成包含真实资源 ID 的 wrangler.local.toml
+# 启用 R2 / KV 时先设置 CFMEMOS_ENABLE_R2=true / CFMEMOS_ENABLE_KV=true
 npm run cf:setup
 
 # 初始化数据库
@@ -106,13 +109,18 @@ npm run cf:deploy
 
 推送到 `main` 分支会自动触发部署。需要在 GitHub 仓库 Settings → Secrets and variables → Actions 中添加：
 
-| Secret | 说明 |
+| Secret / Variable | 说明 |
 |--------|------|
-| `CLOUDFLARE_API_TOKEN` | Cloudflare API Token（需要 Workers Scripts:Edit、D1:Edit、R2:Edit 权限） |
+| `CLOUDFLARE_API_TOKEN` | Cloudflare API Token（需要 Workers Scripts:Edit、D1:Edit；启用 R2 / KV 时还需要对应权限） |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare Account ID（在 Dashboard 右侧栏可找到） |
 | `JWT_SECRET` | 可选。首次部署时写入；未配置时脚本会自动生成 |
+| `CFMEMOS_ENABLE_R2` | 可选 Variable。设为 `true` 时创建/绑定 R2，默认关闭 |
+| `CFMEMOS_ENABLE_KV` | 可选 Variable。设为 `true` 时创建/绑定 KV，默认关闭 |
+| `CFMEMOS_D1_NAME` | 可选 Variable。D1 数据库名称，默认 `memos` |
+| `CFMEMOS_R2_BUCKET` | 可选 Variable。R2 存储桶名称，默认 `memos` |
+| `CFMEMOS_KV_NAME` | 可选 Variable。KV 命名空间名称，默认 `memos` |
 
-工作流会自动完成：安装依赖 → 构建前端 → 创建或复用 D1/R2 → 生成 `wrangler.local.toml` → 执行数据库迁移 → 写入 `JWT_SECRET` → 部署 Worker。
+工作流会自动完成：安装依赖 → 构建前端 → 创建或复用 D1（按需创建 R2 / KV）→ 生成 `wrangler.local.toml` → 执行数据库迁移 → 写入 `JWT_SECRET` → 部署 Worker。
 
 
 ## 本地开发
@@ -133,7 +141,7 @@ npm run dev:web
 ## 项目结构
 
 ```
-├── wrangler.toml          # Cloudflare 配置（D1、R2、AI 绑定，不含真实资源 ID）
+├── wrangler.toml          # Cloudflare 配置（默认仅 D1 + AI，R2 / KV 由变量开启）
 ├── package.json           # 根 package，部署脚本
 ├── scripts/
 │   └── cloudflare-deploy.mjs  # 自动创建/绑定/初始化/部署
@@ -173,9 +181,11 @@ npm run dev:web
 |------|------|------|
 | `JWT_SECRET` | JWT 签名密钥；未设置时 `cf:deploy` 会自动生成 | 是 |
 | `INSTANCE_NAME` | 实例名称，显示在页面标题 | 否 |
+| `CFMEMOS_ENABLE_R2` | 设为 `true` / `1` 时创建并绑定 R2，默认关闭 | 否 |
+| `CFMEMOS_ENABLE_KV` | 设为 `true` / `1` 时创建并绑定 KV，默认关闭 | 否 |
 | `CFMEMOS_D1_NAME` | 自动创建/查找的 D1 数据库名称，默认 `memos` | 否 |
-| `CFMEMOS_R2_BUCKET` | 自动创建/查找的 R2 存储桶名称，默认 `memos` | 否 |
-| `CFMEMOS_KV_NAME` | 启用 KV 后自动创建/查找的命名空间名称，默认 `cfmemos-cache` | 否 |
+| `CFMEMOS_R2_BUCKET` | 启用 R2 后自动创建/查找的存储桶名称，默认 `memos` | 否 |
+| `CFMEMOS_KV_NAME` | 启用 KV 后自动创建/查找的命名空间名称，默认 `memos` | 否 |
 
 生产环境通过 `wrangler secret put` 设置敏感变量，非敏感变量在 `wrangler.toml` 的 `[vars]` 中配置。
 
@@ -183,11 +193,13 @@ npm run dev:web
 
 | 绑定名 | 类型 | 用途 |
 |--------|------|------|
-| `DB` | D1 Database | 存储用户、备忘录、设置等所有结构化数据 |
-| `BUCKET` | R2 Bucket | 存储附件文件（图片、音频、文档） |
-| `CACHE` | KV Namespace（可选） | 缓存实例统计、用户统计与链接元数据；未启用时自动跳过缓存 |
+| `DB` | D1 Database | 必选。存储用户、备忘录、设置等所有结构化数据 |
+| `BUCKET` | R2 Bucket（可选） | 存储附件文件（图片、音频、文档）；默认不绑定，`CFMEMOS_ENABLE_R2=true` 时启用 |
+| `CACHE` | KV Namespace（可选） | 缓存实例统计、用户统计与链接元数据；默认不绑定，`CFMEMOS_ENABLE_KV=true` 时启用 |
 | `AI` | Workers AI | 音频转写（@cf/openai/whisper） |
 | `ASSETS` | Static Assets | 托管前端构建产物 |
+
+未启用 R2 时，附件上传可通过实例设置中的 S3 / WebDAV 存储后端完成；两者都未配置时上传附件会返回错误，其他功能不受影响。
 
 ## 自定义域名
 

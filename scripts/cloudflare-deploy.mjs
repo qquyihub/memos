@@ -4,7 +4,9 @@
  *
  * 参考 CF-Navs / cloudflare_temp_email / edgeever 的部署约定：
  * - 仓库中的 wrangler.toml 不保存真实资源 ID；
- * - 本脚本按名称查找或创建 D1 / R2；
+ * - 默认仅使用 D1；R2 / KV 需通过 CFMEMOS_ENABLE_R2 / CFMEMOS_ENABLE_KV 显式开启；
+ * - D1 / R2 / KV 的资源名称均可用变量覆盖，默认都是 memos；
+ * - 本脚本按名称查找或创建已启用的资源；
  * - 生成被 Git 忽略的 wrangler.local.toml 完成绑定；
  * - 自动执行 D1 migrations、写入 JWT_SECRET、构建并部署。
  *
@@ -37,8 +39,13 @@ const commands = new Set(["doctor", "setup", "init", "deploy"]);
 
 const d1Name = (process.env.CFMEMOS_D1_NAME || "memos").trim();
 const r2Bucket = (process.env.CFMEMOS_R2_BUCKET || "memos").trim();
-const kvName = (process.env.CFMEMOS_KV_NAME || "cfmemos-cache").trim();
+const kvName = (process.env.CFMEMOS_KV_NAME || "memos").trim();
 const kvBinding = "CACHE";
+const parseFlag = (value) =>
+  ["1", "true", "yes", "on"].includes(String(value ?? "").trim().toLowerCase());
+// 默认只使用 D1；R2 / KV 通过变量显式启用。
+const r2Enabled = parseFlag(process.env.CFMEMOS_ENABLE_R2);
+const kvEnabled = parseFlag(process.env.CFMEMOS_ENABLE_KV);
 const jwtSecretName = "JWT_SECRET";
 const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
@@ -89,11 +96,11 @@ const readBaseConfig = () => {
   return readFileSync(baseConfigPath, "utf8");
 };
 
-// 只在 wrangler.toml 中取消 [[kv_namespaces]] 与 binding = "CACHE" 两行注释时启用 KV。
-const locateKvBlock = (config) => {
+// 从基础配置中移除指定资源块（例如 [[r2_buckets]]），由脚本按变量决定是否重新生成。
+const stripBlock = (config, header) => {
   const lines = config.split(/\r?\n/);
-  const start = lines.findIndex((line) => /^\s*\[\[kv_namespaces\]\]\s*$/.test(line));
-  if (start < 0) return null;
+  const start = lines.findIndex((line) => line.trim() === header);
+  if (start < 0) return config;
 
   let end = lines.length;
   for (let i = start + 1; i < lines.length; i += 1) {
@@ -103,14 +110,11 @@ const locateKvBlock = (config) => {
     }
   }
 
-  const bindingPattern = new RegExp(`^\\s*binding\\s*=\\s*"${kvBinding}"\\s*$`, "i");
-  if (!lines.slice(start + 1, end).some((line) => bindingPattern.test(line))) {
-    return null;
-  }
-  return { start, end };
+  lines.splice(start, end - start);
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
 };
 
-const kvEnabled = () => locateKvBlock(readBaseConfig()) !== null;
+const appendBlock = (config, lines) => `${config.trimEnd()}\n\n${lines.join("\n")}\n`;
 
 const workerName = () => readBaseConfig().match(/^name\s*=\s*"([^"]+)"/m)?.[1] ?? "cfmemos";
 
@@ -305,61 +309,54 @@ const ensureKV = () => {
   return "";
 };
 
-const replaceKvId = (config, namespaceId) => {
-  if (!namespaceId) return config;
-  const block = locateKvBlock(config);
-  if (!block) return config;
-
-  const lines = config.split(/\r?\n/);
-  const idIndex = lines.findIndex(
-    (line, index) => index > block.start && index < block.end && /^\s*id\s*=\s*"[^"]*"\s*$/.test(line),
-  );
-  if (idIndex >= 0) {
-    lines[idIndex] = `id = "${namespaceId}"`;
-    return lines.join("\n");
-  }
-
-  const bindingIndex = lines.findIndex(
-    (line, index) => index > block.start && index < block.end && /^\s*binding\s*=\s*"[^"]*"\s*$/.test(line),
-  );
-  lines.splice(bindingIndex >= 0 ? bindingIndex + 1 : block.start + 1, 0, `id = "${namespaceId}"`);
-  return lines.join("\n");
-};
-
-const replaceD1Id = (config, databaseId) => {
-  if (!databaseId) return config;
-
+const applyD1 = (config, databaseId) => {
   const blockStart = config.indexOf("[[d1_databases]]");
   if (blockStart < 0) {
-    return `${config.trimEnd()}\n\n[[d1_databases]]\nbinding = "DB"\ndatabase_name = "${d1Name}"\ndatabase_id = "${databaseId}"\n`;
+    const idLine = databaseId ? `database_id = "${databaseId}"\n` : "";
+    return `${config.trimEnd()}\n\n[[d1_databases]]\nbinding = "DB"\ndatabase_name = "${d1Name}"\n${idLine}`;
   }
 
   const nextBlock = config.indexOf("\n[[", blockStart + "[[d1_databases]]".length);
   const blockEnd = nextBlock >= 0 ? nextBlock + 1 : config.length;
   const block = config.slice(blockStart, blockEnd);
-  const updatedBlock = /database_id\s*=/.test(block)
-    ? block.replace(/database_id\s*=\s*"[^"]*"/, `database_id = "${databaseId}"`)
-    : block.replace(
-        /(database_name\s*=\s*"[^"]*")/,
-        `$1\ndatabase_id = "${databaseId}"`,
-      );
+  let updatedBlock = block.replace(
+    /database_name\s*=\s*"[^"]*"/,
+    `database_name = "${d1Name}"`,
+  );
+
+  if (databaseId) {
+    updatedBlock = /database_id\s*=/.test(updatedBlock)
+      ? updatedBlock.replace(/database_id\s*=\s*"[^"]*"/, `database_id = "${databaseId}"`)
+      : updatedBlock.replace(
+          /(database_name\s*=\s*"[^"]*")/,
+          `$1\ndatabase_id = "${databaseId}"`,
+        );
+  }
 
   return `${config.slice(0, blockStart)}${updatedBlock}${config.slice(blockEnd)}`;
 };
 
-const replaceR2Bucket = (config, bucketName) => {
-  if (!bucketName) return config;
-  if (/^bucket_name\s*=/m.test(config)) {
-    return config.replace(/^bucket_name\s*=\s*"[^"]*"/m, `bucket_name = "${bucketName}"`);
-  }
-  return `${config.trimEnd()}\n\n[[r2_buckets]]\nbinding = "BUCKET"\nbucket_name = "${bucketName}"\n`;
-};
-
+// 默认只保留 D1；R2 / KV 仅在对应变量开启时写入绑定。
 const writeLocalConfig = (databaseId, kvId) => {
-  const config = replaceKvId(
-    replaceR2Bucket(replaceD1Id(readBaseConfig(), databaseId), r2Bucket),
-    kvId,
-  );
+  let config = stripBlock(stripBlock(readBaseConfig(), "[[r2_buckets]]"), "[[kv_namespaces]]");
+  config = applyD1(config, databaseId);
+
+  if (r2Enabled) {
+    config = appendBlock(config, [
+      "[[r2_buckets]]",
+      'binding = "BUCKET"',
+      `bucket_name = "${r2Bucket}"`,
+    ]);
+  }
+
+  if (kvEnabled) {
+    config = appendBlock(config, [
+      "[[kv_namespaces]]",
+      `binding = "${kvBinding}"`,
+      `id = "${kvId}"`,
+    ]);
+  }
+
   const banner = [
     "# 此文件由 scripts/cloudflare-deploy.mjs 自动生成，包含本账号的真实资源 ID。",
     "# 已加入 .gitignore，请勿提交。",
@@ -371,7 +368,7 @@ const writeLocalConfig = (databaseId, kvId) => {
     return;
   }
 
-  writeFileSync(localConfigPath, `${banner}${config}`, "utf8");
+  writeFileSync(localConfigPath, `${banner}${config.trimEnd()}\n`, "utf8");
   ok("本地配置", localConfigPath);
 };
 
@@ -540,10 +537,10 @@ const setup = () => {
   const databaseId = ensureD1();
   if (!databaseId && !dryRun) return false;
 
-  if (!ensureR2()) return false;
+  if (r2Enabled && !ensureR2()) return false;
 
   let kvId = "";
-  if (kvEnabled()) {
+  if (kvEnabled) {
     kvId = ensureKV();
     if (!kvId && !dryRun) return false;
   }
@@ -581,14 +578,18 @@ const doctor = () => {
     passed = false;
   }
 
-  if (hasR2Bucket()) {
-    ok("R2 存储桶", r2Bucket);
+  if (r2Enabled) {
+    if (hasR2Bucket()) {
+      ok("R2 存储桶", r2Bucket);
+    } else {
+      log("fail", "R2 存储桶", `未找到 ${r2Bucket}`);
+      passed = false;
+    }
   } else {
-    log("fail", "R2 存储桶", `未找到 ${r2Bucket}`);
-    passed = false;
+    info("R2 存储桶", "未启用，跳过");
   }
 
-  if (existsSync(baseConfigPath) && kvEnabled()) {
+  if (kvEnabled) {
     const { status, namespaces } = listKvNamespaces();
     const found = namespaces.find((item) => item?.title === kvName);
     if (status === 0 && found) {

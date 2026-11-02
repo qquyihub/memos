@@ -33,8 +33,8 @@ jobs:
           GITHUB_VERSION_OWNER: jkjoy
           GITHUB_VERSION_REPO: memos-on-cloudflare
 
-      # 按名称查找或创建 D1 / R2，生成 wrangler.local.toml，执行迁移、
-      # 写入 JWT_SECRET 并部署。已存在的资源与 Secret 会被复用。
+      # 默认只创建/绑定 D1；设置 CFMEMOS_ENABLE_R2 / CFMEMOS_ENABLE_KV 后按需创建 R2 / KV。
+      # 资源名称可用 CFMEMOS_D1_NAME / CFMEMOS_R2_BUCKET / CFMEMOS_KV_NAME 覆盖，默认均为 memos。
       - name: Create, bind, initialize and deploy
         run: node scripts/cloudflare-deploy.mjs deploy --skip-build
         env:
@@ -42,3 +42,8 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           APP_VERSION: ${{ steps.repository_version.outputs.version }}
+          CFMEMOS_ENABLE_R2: ${{ vars.CFMEMOS_ENABLE_R2 }}
+          CFMEMOS_ENABLE_KV: ${{ vars.CFMEMOS_ENABLE_KV }}
+          CFMEMOS_D1_NAME: ${{ vars.CFMEMOS_D1_NAME }}
+          CFMEMOS_R2_BUCKET: ${{ vars.CFMEMOS_R2_BUCKET }}
+          CFMEMOS_KV_NAME: ${{ vars.CFMEMOS_KV_NAME }}
