@@ -28,7 +28,7 @@ bucket_name = "memos"
 
 # 可选 KV 缓存，默认关闭（不创建、不绑定）。
 # 需要使用 KV 时，取消下面两行注释，然后执行 `npm run cf:setup`；
-# 脚本会按 CFMEMOS_KV_NAME（默认 memos-cache）查找或创建命名空间，
+# 脚本会按 CFMEMOS_KV_NAME（默认 cfmemos-cache）查找或创建命名空间，
 # 并把真实 id 写入被 Git 忽略的 wrangler.local.toml。
 #[[kv_namespaces]]
 #binding = "CACHE"

@@ -37,7 +37,7 @@ const commands = new Set(["doctor", "setup", "init", "deploy"]);
 
 const d1Name = (process.env.CFMEMOS_D1_NAME || "memos").trim();
 const r2Bucket = (process.env.CFMEMOS_R2_BUCKET || "memos").trim();
-const kvName = (process.env.CFMEMOS_KV_NAME || "memos-cache").trim();
+const kvName = (process.env.CFMEMOS_KV_NAME || "cfmemos-cache").trim();
 const kvBinding = "CACHE";
 const jwtSecretName = "JWT_SECRET";
 const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
@@ -475,13 +475,14 @@ const applyMigrations = () => {
 };
 
 const buildWeb = () => {
-  info("前端构建", "npm run build:web");
+  info("前端构建", "npm run build");
   if (dryRun) {
     ok("前端构建", "dry-run，跳过");
     return true;
   }
 
-  const result = run("npm", ["run", "build:web"], { stdio: "inherit" });
+  // 使用根 build 脚本：先安装 web 依赖再构建，确保仅在控制台构建环境中也能生成 web/dist。
+  const result = run("npm", ["run", "build"], { stdio: "inherit" });
   if (result.status !== 0) {
     log("fail", "前端构建");
     process.exitCode = 1;

@@ -44,7 +44,8 @@ npm run cf:init     # 对远程 D1 应用 migrations
 npm run cf:deploy   # 构建前端 + 迁移 + 写入 JWT_SECRET + 部署
 ```
 
-`npm run deploy` 等价于一次执行 `setup → build → init → deploy`。
+`npm run cf:deploy` 是完整自动化路径：`setup → build → init → deploy`。
+`npm run deploy` 只是原生的 `wrangler deploy`，要求 `web/dist` 已构建且 `wrangler.local.toml`（或环境变量/Secrets）已就绪。
 
 脚本会：
 
@@ -56,20 +57,29 @@ npm run cf:deploy   # 构建前端 + 迁移 + 写入 JWT_SECRET + 部署
 
 可通过 `CFMEMOS_D1_NAME`、`CFMEMOS_R2_BUCKET`、`CFMEMOS_KV_NAME` 覆盖资源名称。
 
-默认不启用 KV。需要 KV 缓存时，在 `wrangler.toml` 中取消 `[[kv_namespaces]]` 与 `binding = "CACHE"` 两行的注释，再执行 `npm run cf:setup`；脚本会自动创建或复用 `memos-cache` 命名空间，并把真实 `id` 写入 `wrangler.local.toml`。
+默认不启用 KV。需要 KV 缓存时，在 `wrangler.toml` 中取消 `[[kv_namespaces]]` 与 `binding = "CACHE"` 两行的注释，再执行 `npm run cf:setup`；脚本会自动创建或复用 `cfmemos-cache` 命名空间，并把真实 `id` 写入 `wrangler.local.toml`。
 
-### 方式二：Cloudflare 控制台导入 Git 仓库
+### 方式二：Cloudflare 控制台导入 Git 仓库（推荐）
 
-适合在 Cloudflare 上直接新建项目：
+适合直接在 `https://dash.cloudflare.com/` 新建项目：
 
 1. Fork 本仓库；
-2. 进入 **Workers & Pages → Create application → Import a repository**，选择 Fork；
-3. Production branch 选择 `main`，Root directory 留空，Build command 填写 `npm install && cd web && npm install && npm run build`，Deploy command 填写 `node scripts/cloudflare-deploy.mjs deploy --skip-build`；
-4. 确认 Cloudflare 构建使用的 API Token 具备 **D1:Edit** 与 **R2:Edit** 权限（启用 KV 时还需 **Workers KV:Edit**）。脚本会据此自动创建并绑定 `DB`、`BUCKET`（以及启用后的 `CACHE`）；
-5. 在 Worker 的 **Settings → Variables and Secrets** 中确认存在 `JWT_SECRET`（脚本会自动生成，也可自行指定强随机值）；
+2. 进入 **Workers & Pages → Create application → Import a repository**，选择 Fork 与 `main`；
+3. **Build settings**：
+   - Root directory 留空；
+   - Build command：`npm run build`（构建前端生成 `web/dist`，缺失会导致部署失败）；
+   - Deploy command：`node scripts/cloudflare-deploy.mjs deploy --skip-build`；
+4. **API token**：不要使用 Cloudflare 自动生成的默认 Token。默认 Token 只包含 Workers Scripts / KV / R2 编辑权限，**不包含 D1 权限**，无法自动创建或绑定 D1。请先在 **My Profile → API Tokens → Create Token** 创建自定义 Token，至少包含：
+   - Account → **Workers Scripts: Edit**
+   - Account → **D1: Edit**
+   - Account → **Workers R2 Storage: Edit**
+   - Account → **Workers KV Storage: Edit**（仅启用 KV 时需要）
+
+   然后在 Build settings 的 **API token** 中选择该 Token；
+5. 保存并部署。Build command 构建 `web/dist`；Deploy command 会自动完成：查找或创建 D1 `memos` / R2 `memos`（启用 KV 时创建 `cfmemos-cache`）→ 生成 `wrangler.local.toml` → 执行 D1 migrations → 首次部署时写入 `JWT_SECRET` → 部署 Worker；
 6. 部署完成后访问 Workers URL，首次访问会进入管理员注册页面。
 
-> 如果保留 Cloudflare 默认的 Deploy command `npx wrangler deploy`，Cloudflare 会依据 `wrangler.toml` 中无 ID 的声明自动创建并绑定 D1 / R2，但不会执行数据库迁移。此时需要在首次部署后额外运行一次 `npm run cf:init`（或使用方式三）。若启用了 KV，必须使用本仓库的 Deploy command，否则首次部署无法自动创建 KV 命名空间。
+> 如果 Deploy command 使用 Cloudflare 默认的 `npx wrangler deploy`：同样必须配置上面的自定义 API Token（否则 D1 自动供给会因缺少权限失败）。默认命令会依据 `wrangler.toml` 中无 ID 的声明自动创建并绑定 D1 / R2，但**不会执行数据库迁移**，需要在首次部署后于本地仓库运行一次 `npm install && npm run cf:init`（需先 `npx wrangler login`）。
 
 ### 方式三：手动创建资源
 
@@ -163,7 +173,7 @@ npm run dev:web
 | `INSTANCE_NAME` | 实例名称，显示在页面标题 | 否 |
 | `CFMEMOS_D1_NAME` | 自动创建/查找的 D1 数据库名称，默认 `memos` | 否 |
 | `CFMEMOS_R2_BUCKET` | 自动创建/查找的 R2 存储桶名称，默认 `memos` | 否 |
-| `CFMEMOS_KV_NAME` | 启用 KV 后自动创建/查找的命名空间名称，默认 `memos-cache` | 否 |
+| `CFMEMOS_KV_NAME` | 启用 KV 后自动创建/查找的命名空间名称，默认 `cfmemos-cache` | 否 |
 
 生产环境通过 `wrangler secret put` 设置敏感变量，非敏感变量在 `wrangler.toml` 的 `[vars]` 中配置。
 
@@ -216,7 +226,11 @@ npm run dev:web
 
 **Q: 部署后访问显示空白页？**
 
-确认 `npm run build:web` 已执行且 `web/dist/` 目录存在。`wrangler deploy` 会自动上传该目录。
+确认 `npm run build` 已执行且 `web/dist/` 目录存在。`wrangler deploy` 会自动上传该目录。
+
+**Q: 在 Dashboard 部署时报无权限创建 D1 数据库？**
+
+Workers Builds 自动生成的 API Token 不包含 D1 权限。按“方式二”第 4 步创建包含 **D1: Edit** 的自定义 Token，并在 **Settings → Build → API token** 中选择它即可。
 
 **Q: 访问 `/api/*` 返回前端 404 页面？**
 

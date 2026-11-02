@@ -5,12 +5,13 @@
   "scripts": {
     "dev": "wrangler dev",
     "dev:web": "cd web && npm run dev",
+    "build": "npm --prefix web ci --no-audit --no-fund && npm run build:web",
     "build:web": "cd web && npm run build",
     "cf:doctor": "node scripts/cloudflare-deploy.mjs doctor",
     "cf:setup": "node scripts/cloudflare-deploy.mjs setup",
     "cf:init": "node scripts/cloudflare-deploy.mjs init",
     "cf:deploy": "node scripts/cloudflare-deploy.mjs deploy",
-    "deploy": "node scripts/cloudflare-deploy.mjs deploy",
+    "deploy": "wrangler deploy",
     "db:migrate": "wrangler d1 migrations apply memos --local",
     "db:migrate:remote": "node scripts/cloudflare-deploy.mjs init"
   },
