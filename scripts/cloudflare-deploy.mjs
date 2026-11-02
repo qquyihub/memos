@@ -35,8 +35,10 @@ const skipBuild = process.argv.includes("--skip-build");
 const isCI = process.env.CI === "true" || process.env.WORKERS_CI === "1" || process.env.WORKERS_CI === "true";
 const commands = new Set(["doctor", "setup", "init", "deploy"]);
 
-const d1Name = (process.env.CFMEMOS_D1_NAME || "cfmemos-db").trim();
+const d1Name = (process.env.CFMEMOS_D1_NAME || "memos").trim();
 const r2Bucket = (process.env.CFMEMOS_R2_BUCKET || "memos").trim();
+const kvName = (process.env.CFMEMOS_KV_NAME || "memos-cache").trim();
+const kvBinding = "CACHE";
 const jwtSecretName = "JWT_SECRET";
 const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
@@ -86,6 +88,29 @@ const readBaseConfig = () => {
   }
   return readFileSync(baseConfigPath, "utf8");
 };
+
+// 只在 wrangler.toml 中取消 [[kv_namespaces]] 与 binding = "CACHE" 两行注释时启用 KV。
+const locateKvBlock = (config) => {
+  const lines = config.split(/\r?\n/);
+  const start = lines.findIndex((line) => /^\s*\[\[kv_namespaces\]\]\s*$/.test(line));
+  if (start < 0) return null;
+
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i += 1) {
+    if (/^\s*\[\[?[^\]]+\]\]?\s*$/.test(lines[i])) {
+      end = i;
+      break;
+    }
+  }
+
+  const bindingPattern = new RegExp(`^\\s*binding\\s*=\\s*"${kvBinding}"\\s*$`, "i");
+  if (!lines.slice(start + 1, end).some((line) => bindingPattern.test(line))) {
+    return null;
+  }
+  return { start, end };
+};
+
+const kvEnabled = () => locateKvBlock(readBaseConfig()) !== null;
 
 const workerName = () => readBaseConfig().match(/^name\s*=\s*"([^"]+)"/m)?.[1] ?? "cfmemos";
 
@@ -232,6 +257,75 @@ const ensureR2 = () => {
   return false;
 };
 
+const listKvNamespaces = () => {
+  const result = runWrangler(["kv", "namespace", "list"]);
+  if (result.status !== 0) return { status: result.status, namespaces: [] };
+
+  try {
+    const parsed = JSON.parse(stripAnsi(result.stdout));
+    return { status: 0, namespaces: Array.isArray(parsed) ? parsed : [] };
+  } catch {
+    return { status: result.status, namespaces: [] };
+  }
+};
+
+const findKvId = () => listKvNamespaces().namespaces.find((item) => item?.title === kvName)?.id ?? "";
+
+const ensureKV = () => {
+  const existingId = findKvId();
+  if (existingId) {
+    ok("KV 命名空间", `${kvName} (${existingId})`);
+    return existingId;
+  }
+
+  info("KV 命名空间", `未找到 ${kvName}，准备创建`);
+  if (dryRun) {
+    ok("KV 命名空间", `dry-run，将创建 ${kvName}`);
+    return "";
+  }
+
+  const created = runWrangler(["kv", "namespace", "create", kvName]);
+  const createdOutput = outputOf(created);
+  const createdId = createdOutput.match(uuidPattern)?.[0] ?? "";
+  if (created.status === 0 && createdId) {
+    ok("KV 命名空间", `已创建 ${kvName} (${createdId})`);
+    return createdId;
+  }
+
+  if (/already exists|已存在/i.test(createdOutput)) {
+    const reusedId = findKvId();
+    if (reusedId) {
+      ok("KV 命名空间", `已复用 ${kvName} (${reusedId})`);
+      return reusedId;
+    }
+  }
+
+  fail("创建 KV 命名空间", created);
+  console.error(`请在 Cloudflare 控制台创建名为 ${kvName} 的 KV 命名空间，然后重试。`);
+  return "";
+};
+
+const replaceKvId = (config, namespaceId) => {
+  if (!namespaceId) return config;
+  const block = locateKvBlock(config);
+  if (!block) return config;
+
+  const lines = config.split(/\r?\n/);
+  const idIndex = lines.findIndex(
+    (line, index) => index > block.start && index < block.end && /^\s*id\s*=\s*"[^"]*"\s*$/.test(line),
+  );
+  if (idIndex >= 0) {
+    lines[idIndex] = `id = "${namespaceId}"`;
+    return lines.join("\n");
+  }
+
+  const bindingIndex = lines.findIndex(
+    (line, index) => index > block.start && index < block.end && /^\s*binding\s*=\s*"[^"]*"\s*$/.test(line),
+  );
+  lines.splice(bindingIndex >= 0 ? bindingIndex + 1 : block.start + 1, 0, `id = "${namespaceId}"`);
+  return lines.join("\n");
+};
+
 const replaceD1Id = (config, databaseId) => {
   if (!databaseId) return config;
 
@@ -261,8 +355,11 @@ const replaceR2Bucket = (config, bucketName) => {
   return `${config.trimEnd()}\n\n[[r2_buckets]]\nbinding = "BUCKET"\nbucket_name = "${bucketName}"\n`;
 };
 
-const writeLocalConfig = (databaseId) => {
-  const config = replaceR2Bucket(replaceD1Id(readBaseConfig(), databaseId), r2Bucket);
+const writeLocalConfig = (databaseId, kvId) => {
+  const config = replaceKvId(
+    replaceR2Bucket(replaceD1Id(readBaseConfig(), databaseId), r2Bucket),
+    kvId,
+  );
   const banner = [
     "# 此文件由 scripts/cloudflare-deploy.mjs 自动生成，包含本账号的真实资源 ID。",
     "# 已加入 .gitignore，请勿提交。",
@@ -444,7 +541,13 @@ const setup = () => {
 
   if (!ensureR2()) return false;
 
-  writeLocalConfig(databaseId);
+  let kvId = "";
+  if (kvEnabled()) {
+    kvId = ensureKV();
+    if (!kvId && !dryRun) return false;
+  }
+
+  writeLocalConfig(databaseId, kvId);
   return true;
 };
 
@@ -482,6 +585,19 @@ const doctor = () => {
   } else {
     log("fail", "R2 存储桶", `未找到 ${r2Bucket}`);
     passed = false;
+  }
+
+  if (existsSync(baseConfigPath) && kvEnabled()) {
+    const { status, namespaces } = listKvNamespaces();
+    const found = namespaces.find((item) => item?.title === kvName);
+    if (status === 0 && found) {
+      ok("KV 命名空间", `${kvName} (${found.id})`);
+    } else {
+      log("fail", "KV 命名空间", `未找到 ${kvName}`);
+      passed = false;
+    }
+  } else {
+    info("KV 命名空间", "未启用，跳过");
   }
 
   if (existsSync(localConfigPath)) {

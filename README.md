@@ -48,13 +48,15 @@ npm run cf:deploy   # 构建前端 + 迁移 + 写入 JWT_SECRET + 部署
 
 脚本会：
 
-- 按名称 `cfmemos-db` 与 `memos` 查找 D1 / R2；不存在时自动创建，已存在时复用；
+- 按名称 `memos` 查找 D1 / R2；不存在时自动创建，已存在时复用；
 - 将真实资源 ID 只写入 Git 忽略的 `wrangler.local.toml`，不污染仓库；
 - 优先使用 `JWT_SECRET` 环境变量，其次读取 `.dev.vars`，最后自动生成随机值并写入 `.dev.vars`；
 - 仅在远程 Worker 尚无 `JWT_SECRET` 时写入 Secret，重复部署不会轮换密钥；
 - 幂等，可反复执行。
 
-可通过 `CFMEMOS_D1_NAME`、`CFMEMOS_R2_BUCKET` 覆盖资源名称。
+可通过 `CFMEMOS_D1_NAME`、`CFMEMOS_R2_BUCKET`、`CFMEMOS_KV_NAME` 覆盖资源名称。
+
+默认不启用 KV。需要 KV 缓存时，在 `wrangler.toml` 中取消 `[[kv_namespaces]]` 与 `binding = "CACHE"` 两行的注释，再执行 `npm run cf:setup`；脚本会自动创建或复用 `memos-cache` 命名空间，并把真实 `id` 写入 `wrangler.local.toml`。
 
 ### 方式二：Cloudflare 控制台导入 Git 仓库
 
@@ -63,17 +65,17 @@ npm run cf:deploy   # 构建前端 + 迁移 + 写入 JWT_SECRET + 部署
 1. Fork 本仓库；
 2. 进入 **Workers & Pages → Create application → Import a repository**，选择 Fork；
 3. Production branch 选择 `main`，Root directory 留空，Build command 填写 `npm install && cd web && npm install && npm run build`，Deploy command 填写 `node scripts/cloudflare-deploy.mjs deploy --skip-build`；
-4. 确认 Cloudflare 构建使用的 API Token 具备 **D1:Edit** 与 **R2:Edit** 权限。脚本会据此自动创建并绑定 `DB`、`BUCKET`；
+4. 确认 Cloudflare 构建使用的 API Token 具备 **D1:Edit** 与 **R2:Edit** 权限（启用 KV 时还需 **Workers KV:Edit**）。脚本会据此自动创建并绑定 `DB`、`BUCKET`（以及启用后的 `CACHE`）；
 5. 在 Worker 的 **Settings → Variables and Secrets** 中确认存在 `JWT_SECRET`（脚本会自动生成，也可自行指定强随机值）；
 6. 部署完成后访问 Workers URL，首次访问会进入管理员注册页面。
 
-> 如果保留 Cloudflare 默认的 Deploy command `npx wrangler deploy`，Cloudflare 会依据 `wrangler.toml` 中无 ID 的声明自动创建并绑定 D1 / R2，但不会执行数据库迁移。此时需要在首次部署后额外运行一次 `npm run cf:init`（或使用方式三）。
+> 如果保留 Cloudflare 默认的 Deploy command `npx wrangler deploy`，Cloudflare 会依据 `wrangler.toml` 中无 ID 的声明自动创建并绑定 D1 / R2，但不会执行数据库迁移。此时需要在首次部署后额外运行一次 `npm run cf:init`（或使用方式三）。若启用了 KV，必须使用本仓库的 Deploy command，否则首次部署无法自动创建 KV 命名空间。
 
 ### 方式三：手动创建资源
 
 ```bash
 # 创建 D1 数据库
-npx wrangler d1 create cfmemos-db
+npx wrangler d1 create memos
 
 # 创建 R2 存储桶
 npx wrangler r2 bucket create memos
@@ -159,8 +161,9 @@ npm run dev:web
 |------|------|------|
 | `JWT_SECRET` | JWT 签名密钥；未设置时 `cf:deploy` 会自动生成 | 是 |
 | `INSTANCE_NAME` | 实例名称，显示在页面标题 | 否 |
-| `CFMEMOS_D1_NAME` | 自动创建/查找的 D1 数据库名称，默认 `cfmemos-db` | 否 |
+| `CFMEMOS_D1_NAME` | 自动创建/查找的 D1 数据库名称，默认 `memos` | 否 |
 | `CFMEMOS_R2_BUCKET` | 自动创建/查找的 R2 存储桶名称，默认 `memos` | 否 |
+| `CFMEMOS_KV_NAME` | 启用 KV 后自动创建/查找的命名空间名称，默认 `memos-cache` | 否 |
 
 生产环境通过 `wrangler secret put` 设置敏感变量，非敏感变量在 `wrangler.toml` 的 `[vars]` 中配置。
 
@@ -170,6 +173,7 @@ npm run dev:web
 |--------|------|------|
 | `DB` | D1 Database | 存储用户、备忘录、设置等所有结构化数据 |
 | `BUCKET` | R2 Bucket | 存储附件文件（图片、音频、文档） |
+| `CACHE` | KV Namespace（可选） | 缓存实例统计、用户统计与链接元数据；未启用时自动跳过缓存 |
 | `AI` | Workers AI | 音频转写（@cf/openai/whisper） |
 | `ASSETS` | Static Assets | 托管前端构建产物 |
 
@@ -232,7 +236,7 @@ run_worker_first = ["/api/*", "/file/*", "/u/*"]
 
 ```bash
 # 导出 D1 数据库
-wrangler d1 export cfmemos-db --remote --output=backup.sql
+wrangler d1 export memos --remote --output=backup.sql
 
 # R2 文件可通过 rclone 或 Cloudflare Dashboard 下载
 ```

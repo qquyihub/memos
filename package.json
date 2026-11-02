@@ -11,7 +11,7 @@
     "cf:init": "node scripts/cloudflare-deploy.mjs init",
     "cf:deploy": "node scripts/cloudflare-deploy.mjs deploy",
     "deploy": "node scripts/cloudflare-deploy.mjs deploy",
-    "db:migrate": "wrangler d1 migrations apply cfmemos-db --local",
+    "db:migrate": "wrangler d1 migrations apply memos --local",
     "db:migrate:remote": "node scripts/cloudflare-deploy.mjs init"
   },
   "cloudflare": {
