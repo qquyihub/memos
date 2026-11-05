@@ -86,6 +86,14 @@ export type Memo = Message<"memos.api.v1.Memo"> & {
   name: string;
 
   /**
+   * The space in which the memo is placed.
+   * Format: spaces/{space}
+   *
+   * @generated from field: string space = 3;
+   */
+  space?: string;
+
+  /**
    * The state of the memo.
    *
    * @generated from field: memos.api.v1.State state = 2;
@@ -1215,6 +1223,13 @@ export enum Visibility {
    * @generated from enum value: PUBLIC = 3;
    */
   PUBLIC = 3,
+
+  /**
+   * Active members of the memo's space can read the memo.
+   *
+   * @generated from enum value: SPACE = 4;
+   */
+  SPACE = 4,
 }
 
 /**

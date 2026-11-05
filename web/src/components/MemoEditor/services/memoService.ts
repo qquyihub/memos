@@ -48,6 +48,10 @@ function buildUpdateMask(
     mask.add("location");
     patch.location = state.metadata.location;
   }
+  if ((state.metadata.space || "") !== (prevMemo.space || "")) {
+    mask.add("space");
+    patch.space = state.metadata.space;
+  }
 
   // Auto-update timestamp if content changed
   if (["content", "attachments", "relations", "location"].some((key) => mask.has(key))) {
@@ -121,6 +125,7 @@ export const memoService = {
       attachments: toAttachmentReferences(allAttachments),
       relations: state.metadata.relations,
       location: state.metadata.location,
+      space: state.metadata.space,
       createTime: state.timestamps.createTime ? timestampFromDate(state.timestamps.createTime) : undefined,
       updateTime: state.timestamps.updateTime ? timestampFromDate(state.timestamps.updateTime) : undefined,
     });
@@ -157,6 +162,7 @@ export const memoService = {
         attachments: memo.attachments,
         relations: memo.relations,
         location: memo.location,
+        space: memo.space,
       },
       ui: {
         isFocusMode: false,

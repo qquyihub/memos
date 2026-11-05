@@ -61,6 +61,10 @@ const BOOLEAN_FIELD_SQL: Record<string, string> = {
     "COALESCE(json_extract(memo.payload, '$.property.hasIncompleteTasks'), json_extract(memo.payload, '$.property.hasIncompleteTask'), 0)",
   has_incomplete_tasks:
     "COALESCE(json_extract(memo.payload, '$.property.hasIncompleteTasks'), json_extract(memo.payload, '$.property.hasIncompleteTask'), 0)",
+  has_location: "(CASE WHEN json_extract(memo.payload, '$.location') IS NULL THEN 0 ELSE 1 END)",
+  has_attachments: "EXISTS (SELECT 1 FROM attachment AS memo_attachment WHERE memo_attachment.memo_id = memo.id)",
+  has_image:
+    "(CASE WHEN COALESCE(json_extract(memo.payload, '$.property.hasInlineImage'), 0) = 1 OR EXISTS (SELECT 1 FROM attachment AS image_attachment WHERE image_attachment.memo_id = memo.id AND image_attachment.type LIKE 'image/%') THEN 1 ELSE 0 END)",
 };
 
 const SCALAR_FIELD_SQL: Record<string, string> = {
@@ -72,7 +76,7 @@ const SCALAR_FIELD_SQL: Record<string, string> = {
   ...BOOLEAN_FIELD_SQL,
 };
 
-const VISIBILITY_VALUES = new Set(["PUBLIC", "PROTECTED", "PRIVATE"]);
+const VISIBILITY_VALUES = new Set(["PUBLIC", "PROTECTED", "PRIVATE", "SPACE"]);
 
 function tokenize(input: string): Token[] {
   const tokens: Token[] = [];
@@ -607,6 +611,15 @@ async function resolveCreatorId(db: D1Database, value: string): Promise<number |
   return user?.id;
 }
 
+async function resolveSpaceId(db: D1Database, value: string): Promise<number | undefined> {
+  const uid = value.startsWith("spaces/") ? value.slice("spaces/".length) : value;
+  if (!uid) {
+    return undefined;
+  }
+  const row = await db.prepare("SELECT id FROM space WHERE uid = ?").bind(uid).first<{ id: number }>();
+  return row?.id;
+}
+
 class SqlCompiler {
   async compile(node: AstNode, ctx: CompileContext): Promise<MemoFilterWhere> {
     return parenthesize(await this.compileBoolean(node, ctx));
@@ -676,6 +689,12 @@ class SqlCompiler {
     }
     if (rightField === "tag" && (op === "==" || op === "!=")) {
       return this.compileTagComparison(op, leftNode, ctx);
+    }
+    if (leftField === "space") {
+      return this.compileSpaceComparison(op, rightNode, ctx, false);
+    }
+    if (rightField === "space") {
+      return this.compileSpaceComparison(swapComparisonOperator(op), leftNode, ctx, true);
     }
 
     const left = await this.resolveOperand(leftNode, ctx);
@@ -747,9 +766,43 @@ class SqlCompiler {
     return { sql: `memo.creator_id ${effectiveOp} ?`, params: [creatorId] };
   }
 
+  private async compileSpaceComparison(
+    op: string,
+    valueNode: AstNode,
+    ctx: CompileContext,
+    swapped: boolean,
+  ): Promise<MemoFilterWhere> {
+    const effectiveOp = swapped ? swapComparisonOperator(op) : op;
+    if (effectiveOp !== "==" && effectiveOp !== "!=") {
+      throw new MemoFilterError("space only supports == and !=");
+    }
+
+    if (valueNode.type === "identifier" && valueNode.name === "null") {
+      return { sql: effectiveOp === "==" ? "memo.space_id IS NULL" : "memo.space_id IS NOT NULL", params: [] };
+    }
+
+    const value = evaluateStatic(valueNode, ctx);
+    if (typeof value !== "string") {
+      throw new MemoFilterError("space comparisons expect a space resource string or null");
+    }
+
+    const spaceId = await resolveSpaceId(ctx.db, value);
+    if (spaceId === undefined) {
+      return { sql: effectiveOp === "==" ? "0 = 1" : "memo.space_id IS NOT NULL", params: [] };
+    }
+    return {
+      sql: effectiveOp === "==" ? "memo.space_id = ?" : "memo.space_id != ?",
+      params: [spaceId],
+    };
+  }
+
   private async compileIn(leftNode: AstNode, rightNode: AstNode, ctx: CompileContext): Promise<MemoFilterWhere> {
     const leftField = getFieldName(leftNode);
     const rightField = getFieldName(rightNode);
+
+    if (leftField === "space") {
+      throw new MemoFilterError("space does not support the in operator");
+    }
 
     if (leftField === "tag") {
       const values = getLiteralArray(rightNode, ctx);

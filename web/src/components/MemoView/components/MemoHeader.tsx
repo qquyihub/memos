@@ -16,9 +16,10 @@ import UserAvatar from "../../UserAvatar";
 import VisibilityIcon from "../../VisibilityIcon";
 import { useMemoActions } from "../hooks";
 import { useMemoViewContext, useMemoViewDerived } from "../MemoViewContext";
+import MemoSpaceBadge from "./MemoSpaceBadge";
 import type { MemoHeaderProps } from "../types";
 
-const MemoHeader: React.FC<MemoHeaderProps> = ({ showCreator, showVisibility, showPinned }) => {
+const MemoHeader: React.FC<MemoHeaderProps> = ({ showCreator, showVisibility, showPinned, showSpace }) => {
   const t = useTranslate();
   const [reactionSelectorOpen, setReactionSelectorOpen] = useState(false);
 
@@ -60,6 +61,7 @@ const MemoHeader: React.FC<MemoHeaderProps> = ({ showCreator, showVisibility, sh
       </div>
 
       <div className="flex flex-row justify-end items-center select-none shrink-0 gap-2">
+        {showSpace && memo.space && <MemoSpaceBadge spaceName={memo.space} />}
         {currentUser && !isArchived && (
           <ReactionSelector
             className={cn("border-none w-auto h-auto", reactionSelectorOpen && "block!", "block sm:hidden sm:group-hover:block")}

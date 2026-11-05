@@ -30,8 +30,8 @@ jobs:
         run: node scripts/fetch-github-version.mjs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_VERSION_OWNER: jkjoy
-          GITHUB_VERSION_REPO: memos-on-cloudflare
+          GITHUB_VERSION_OWNER: usememos
+          GITHUB_VERSION_REPO: memos
 
       # 默认只创建/绑定 D1；设置 CFMEMOS_ENABLE_R2 / CFMEMOS_ENABLE_KV 后按需创建 R2 / KV。
       # 资源名称可用 CFMEMOS_D1_NAME / CFMEMOS_R2_BUCKET / CFMEMOS_KV_NAME 覆盖，默认均为 memos。

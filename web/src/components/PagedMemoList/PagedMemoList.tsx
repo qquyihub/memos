@@ -29,6 +29,10 @@ interface Props {
   enabled?: boolean;
   /** When true, render the inline MemoEditor above the list (e.g. on the Home page). */
   showMemoEditor?: boolean;
+  /** Default space placement for the inline editor, e.g. `spaces/team`. */
+  defaultSpace?: string;
+  /** Overrides the date derived from the active filters for the inline editor. */
+  defaultCreateTime?: Date;
 }
 
 function useAutoFetchWhenNotScrollable({
@@ -88,7 +92,8 @@ const PagedMemoList = (props: Props) => {
   const { filters } = useMemoFilterContext();
 
   const showMemoEditor = props.showMemoEditor ?? false;
-  const defaultCreateTime = useMemo(() => deriveDefaultCreateTimeFromFilters(filters), [filters]);
+  const filterDefaultCreateTime = useMemo(() => deriveDefaultCreateTimeFromFilters(filters), [filters]);
+  const defaultCreateTime = props.defaultCreateTime ?? filterDefaultCreateTime;
 
   const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isLoading } = useInfiniteMemos(
     {
@@ -164,6 +169,7 @@ const PagedMemoList = (props: Props) => {
                   cacheKey="home-memo-editor"
                   placeholder={t("editor.any-thoughts")}
                   defaultCreateTime={defaultCreateTime}
+                  defaultSpace={props.defaultSpace}
                 />
               </Suspense>
             ) : null}

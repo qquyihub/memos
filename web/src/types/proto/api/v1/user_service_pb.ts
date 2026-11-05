@@ -1521,6 +1521,13 @@ export enum UserNotification_Type {
    * @generated from enum value: MEMO_MENTION = 2;
    */
   MEMO_MENTION = 2,
+
+  /**
+   * Someone invited the receiver to a space.
+   *
+   * @generated from enum value: SPACE_INVITATION = 3;
+   */
+  SPACE_INVITATION = 3,
 }
 
 /**

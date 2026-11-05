@@ -1,4 +1,14 @@
-import { BellIcon, EarthIcon, LibraryIcon, PaperclipIcon, UserCircleIcon } from "lucide-react";
+import {
+  BellIcon,
+  CalendarIcon,
+  EarthIcon,
+  LibraryIcon,
+  ListFilterIcon,
+  MapIcon,
+  PaperclipIcon,
+  UserCircleIcon,
+  UsersIcon,
+} from "lucide-react";
 import { NavLink } from "react-router-dom";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import useCurrentUser from "@/hooks/useCurrentUser";
@@ -40,6 +50,30 @@ const Navigation = (props: Props) => {
     title: t("common.explore"),
     icon: <EarthIcon className="w-6 h-auto shrink-0" />,
   };
+  const calendarNavLink: NavLinkItem = {
+    id: "header-calendar",
+    path: Routes.CALENDAR,
+    title: t("calendar.calendar"),
+    icon: <CalendarIcon className="w-6 h-auto shrink-0" />,
+  };
+  const mapNavLink: NavLinkItem = {
+    id: "header-map",
+    path: Routes.MAP,
+    title: t("map.map"),
+    icon: <MapIcon className="w-6 h-auto shrink-0" />,
+  };
+  const spacesNavLink: NavLinkItem = {
+    id: "header-spaces",
+    path: Routes.SPACES,
+    title: t("space.spaces"),
+    icon: <UsersIcon className="w-6 h-auto shrink-0" />,
+  };
+  const viewsNavLink: NavLinkItem = {
+    id: "header-views",
+    path: Routes.VIEWS,
+    title: t("view.views"),
+    icon: <ListFilterIcon className="w-6 h-auto shrink-0" />,
+  };
   const attachmentsNavLink: NavLinkItem = {
     id: "header-attachments",
     path: Routes.ATTACHMENTS,
@@ -70,8 +104,8 @@ const Navigation = (props: Props) => {
   };
 
   const primaryNavLinks: NavLinkItem[] = currentUser
-    ? [homeNavLink, exploreNavLink, attachmentsNavLink, inboxNavLink]
-    : [exploreNavLink, signInNavLink];
+    ? [homeNavLink, exploreNavLink, calendarNavLink, mapNavLink, spacesNavLink, viewsNavLink, attachmentsNavLink, inboxNavLink]
+    : [exploreNavLink, calendarNavLink, signInNavLink];
   const inboxAriaLabel = unreadCount > 0 ? `${t("common.inbox")}, ${unreadCount} unread` : t("common.inbox");
 
   return (

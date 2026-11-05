@@ -1,4 +1,4 @@
-import { Globe2Icon, LockIcon, UsersIcon } from "lucide-react";
+import { Globe2Icon, LockIcon, UsersIcon, UsersRoundIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Visibility } from "@/types/proto/api/v1/memo_service_pb";
 
@@ -17,6 +17,8 @@ const VisibilityIcon = (props: Props) => {
     VIcon = UsersIcon;
   } else if (visibility === Visibility.PUBLIC) {
     VIcon = Globe2Icon;
+  } else if (visibility === Visibility.SPACE) {
+    VIcon = UsersRoundIcon;
   }
   if (!VIcon) {
     return null;

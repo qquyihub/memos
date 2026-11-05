@@ -18,7 +18,7 @@ const MemoEditor = lazy(() => import("../MemoEditor"));
 const MemoShareImageDialog = lazy(() => import("../MemoActionMenu/MemoShareImageDialog"));
 
 const MemoView: React.FC<MemoViewProps> = (props: MemoViewProps) => {
-  const { memo: memoData, className, parentPage: parentPageProp, compact, showCreator, showVisibility, showPinned } = props;
+  const { memo: memoData, className, parentPage: parentPageProp, compact, showCreator, showVisibility, showPinned, showSpace } = props;
   const cardRef = useRef<HTMLDivElement>(null);
   const [showEditor, setShowEditor] = useState(false);
   const [cardWidth, setCardWidth] = useState(0);
@@ -124,7 +124,7 @@ const MemoView: React.FC<MemoViewProps> = (props: MemoViewProps) => {
       ref={cardRef}
       tabIndex={readonly ? -1 : 0}
     >
-      <MemoHeader showCreator={showCreator} showVisibility={showVisibility} showPinned={showPinned} />
+      <MemoHeader showCreator={showCreator} showVisibility={showVisibility} showPinned={showPinned} showSpace={showSpace} />
 
       <MemoBody compact={compact} />
 

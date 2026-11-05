@@ -6,6 +6,7 @@ export interface MemoViewProps {
   showCreator?: boolean;
   showVisibility?: boolean;
   showPinned?: boolean;
+  showSpace?: boolean;
   className?: string;
   parentPage?: string;
   shareImageDialogOpen?: boolean;
@@ -16,6 +17,7 @@ export interface MemoHeaderProps {
   showCreator?: boolean;
   showVisibility?: boolean;
   showPinned?: boolean;
+  showSpace?: boolean;
 }
 
 export interface MemoBodyProps {

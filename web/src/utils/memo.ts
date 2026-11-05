@@ -8,6 +8,8 @@ export const convertVisibilityFromString = (visibility: string) => {
       return Visibility.PROTECTED;
     case "PRIVATE":
       return Visibility.PRIVATE;
+    case "SPACE":
+      return Visibility.SPACE;
     default:
       return Visibility.PUBLIC;
   }
@@ -21,6 +23,8 @@ export const convertVisibilityToString = (visibility: Visibility) => {
       return "PROTECTED";
     case Visibility.PRIVATE:
       return "PRIVATE";
+    case Visibility.SPACE:
+      return "SPACE";
     default:
       return "PRIVATE";
   }

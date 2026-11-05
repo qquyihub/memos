@@ -42,6 +42,7 @@ const MemoEditorImpl: React.FC<MemoEditorProps> = ({
   autoFocus,
   placeholder,
   defaultCreateTime,
+  defaultSpace,
   onConfirm,
   onCancel,
 }) => {
@@ -74,6 +75,7 @@ const MemoEditorImpl: React.FC<MemoEditorProps> = ({
     autoFocus,
     defaultVisibility,
     defaultCreateTime,
+    defaultSpace,
   });
   const isDraftCacheEnabled = !memo;
 
@@ -234,6 +236,11 @@ const MemoEditorImpl: React.FC<MemoEditorProps> = ({
   useKeyboard(editorRef, handleSave);
 
   async function handleSave() {
+    if (state.metadata.visibility === convertVisibilityFromString("SPACE") && !state.metadata.space) {
+      toast.error(t("space.select-space-first"));
+      return;
+    }
+
     // Validate before saving
     const { valid, reason, reasonKey, reasonParams } = validationService.canSave(state, {
       contentLengthLimit: memoRelatedSetting.contentLengthLimit,
@@ -280,6 +287,9 @@ const MemoEditorImpl: React.FC<MemoEditorProps> = ({
       dispatch(actions.reset());
       if (!memoName && defaultVisibility) {
         dispatch(actions.setMetadata({ visibility: defaultVisibility }));
+      }
+      if (!memoName && defaultSpace) {
+        dispatch(actions.setMetadata({ space: defaultSpace, visibility: convertVisibilityFromString("SPACE") }));
       }
       // Re-seed the calendar-derived timestamps so the popover stays visible
       // and subsequent memos in the same filter session keep the prefilled date.

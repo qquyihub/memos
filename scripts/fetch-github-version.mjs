@@ -1,6 +1,6 @@
 import { appendFileSync } from "node:fs";
 
-const fallbackVersion = process.env.npm_package_version || "1.0.0";
+const fallbackVersion = process.env.npm_package_version || "26.11.0";
 
 const headers = {
   "User-Agent": "cfmemos-version-sync",
@@ -10,8 +10,8 @@ const headers = {
 if (process.env.GITHUB_TOKEN) {
   headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
 }
-const owner = process.env.GITHUB_VERSION_OWNER || "jkjoy";
-const repo = process.env.GITHUB_VERSION_REPO || "memos-on-cloudflare";
+const owner = process.env.GITHUB_VERSION_OWNER || "usememos";
+const repo = process.env.GITHUB_VERSION_REPO || "memos";
 
 function normalizeVersion(value) {
   if (typeof value !== "string") {

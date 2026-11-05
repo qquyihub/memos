@@ -5,6 +5,7 @@ import * as memoDB from "../db/memo";
 import * as relationDB from "../db/relation";
 import * as reactionDB from "../db/reaction";
 import * as shareDB from "../db/share";
+import * as spaceDB from "../db/space";
 import * as settingDB from "../db/setting";
 import { createErrorBody } from "../error";
 import { deleteCachedKeys, getCachedJson, putCachedJson, sha256Hex } from "../cache";
@@ -134,6 +135,7 @@ function parseMemoPayload(content: string) {
   const hasTaskList = /- \[[ x]\]/.test(content);
   const hasCode = /```[\s\S]*?```/.test(content) || /`[^`]+`/.test(content);
   const hasIncompleteTask = /- \[ \]/.test(content);
+  const hasInlineImage = /!\[[^\]]*\]\([^)]+\)/.test(content) || /<img\s/i.test(content);
 
   const lines = content.split("\n");
   let title = "";
@@ -147,8 +149,55 @@ function parseMemoPayload(content: string) {
 
   return {
     tags,
-    property: { hasLink, hasTaskList, hasCode, hasIncompleteTask, title },
+    property: { hasLink, hasTaskList, hasCode, hasIncompleteTask, hasInlineImage, title },
   };
+}
+
+function normalizeVisibility(value: unknown, fallback = "PRIVATE"): string {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "number") {
+    switch (value) {
+      case 1:
+        return "PRIVATE";
+      case 2:
+        return "PROTECTED";
+      case 3:
+        return "PUBLIC";
+      case 4:
+        return "SPACE";
+      default:
+        return fallback;
+    }
+  }
+  const normalized = String(value).toUpperCase();
+  return ["PRIVATE", "PROTECTED", "PUBLIC", "SPACE"].includes(normalized) ? normalized : fallback;
+}
+
+function parseSpaceUid(value: string): string {
+  return value.startsWith("spaces/") ? value.slice("spaces/".length) : value;
+}
+
+async function resolveMemoSpace(
+  db: D1Database,
+  value: unknown,
+  user: UserPayload,
+): Promise<{ spaceId: number | null } | { status: 400 | 403 | 404; message: string }> {
+  if (value === undefined || value === null || value === "") {
+    return { spaceId: null };
+  }
+  if (typeof value !== "string") {
+    return { status: 400, message: "Invalid space" };
+  }
+
+  const uid = parseSpaceUid(value);
+  const space = await db.prepare("SELECT id, uid FROM space WHERE uid = ?").bind(uid).first<{ id: number; uid: string }>();
+  if (!space) {
+    return { status: 404, message: "Space not found" };
+  }
+  if (user.role !== "ADMIN" && !(await spaceDB.isActiveSpaceMember(db, space.id, user.id))) {
+    return { status: 404, message: "Space not found" };
+  }
+  return { spaceId: space.id };
 }
 
 function buildMemoSnippet(content: string, limit = 200): string {
@@ -171,25 +220,65 @@ function formatMemo(memo: memoDB.MemoRow, creatorUsername?: string) {
     snippet: buildMemoSnippet(memo.content),
     ...(payload.parent ? { parent: payload.parent } : {}),
     ...(payload.location ? { location: payload.location } : {}),
+    ...(memo.space_id && memo.space_uid ? { space: `spaces/${memo.space_uid}` } : {}),
   };
 }
 
-function getMemoReadDeniedStatus(memo: Pick<memoDB.MemoRow, "visibility" | "creator_id">, user: UserPayload | undefined): 401 | 403 | undefined {
-  if (memo.visibility === "PRIVATE" && (!user || user.id !== memo.creator_id)) {
-    return 403;
+function getMemoReadDeniedStatus(
+  memo: Pick<memoDB.MemoRow, "visibility" | "creator_id" | "space_id" | "row_status">,
+  user: UserPayload | undefined,
+  memberSpaceIds: Set<number> = new Set(),
+): 401 | 403 | 404 | undefined {
+  if (memo.row_status === "ARCHIVED" && (!user || (user.id !== memo.creator_id && user.role !== "ADMIN"))) {
+    return 404;
   }
-  if (memo.visibility === "PROTECTED" && !user) {
-    return 401;
+  if (user?.role === "ADMIN") {
+    return undefined;
   }
-  return undefined;
+  if (memo.visibility === "PUBLIC") {
+    return undefined;
+  }
+  if (memo.visibility === "PROTECTED") {
+    return user ? undefined : 401;
+  }
+  if (memo.visibility === "SPACE") {
+    if (!user) {
+      return 401;
+    }
+    if (user.id === memo.creator_id) {
+      return undefined;
+    }
+    return memo.space_id && memberSpaceIds.has(memo.space_id) ? undefined : 403;
+  }
+  if (memo.visibility === "PRIVATE") {
+    return user && user.id === memo.creator_id ? undefined : user ? 403 : 401;
+  }
+  return 404;
 }
 
-function getMemoReadErrorMessage(status: 401 | 403): string {
-  return status === 401 ? "Authentication required" : "Permission denied";
+async function getMemoMembershipScope(db: D1Database, memo: memoDB.MemoRow, user: UserPayload | undefined): Promise<Set<number>> {
+  if (!user || memo.visibility !== "SPACE" || !memo.space_id || user.id === memo.creator_id) {
+    return new Set();
+  }
+  return spaceDB.getActiveSpaceIdsForUser(db, user.id);
 }
 
-function formatMemoRelationSnippet(memo: Pick<memoDB.MemoRow, "uid" | "content" | "visibility" | "creator_id"> | undefined, user: UserPayload | undefined) {
-  if (!memo || getMemoReadDeniedStatus(memo, user)) {
+async function getMemoReadDeniedStatusForRequest(db: D1Database, memo: memoDB.MemoRow, user: UserPayload | undefined) {
+  return getMemoReadDeniedStatus(memo, user, await getMemoMembershipScope(db, memo, user));
+}
+
+function getMemoReadErrorMessage(status: 401 | 403 | 404): string {
+  if (status === 401) return "Authentication required";
+  if (status === 404) return "Memo not found";
+  return "Permission denied";
+}
+
+function formatMemoRelationSnippet(
+  memo: Pick<memoDB.MemoRow, "uid" | "content" | "visibility" | "creator_id" | "space_id" | "row_status"> | undefined,
+  user: UserPayload | undefined,
+  memberSpaceIds: Set<number> = new Set(),
+) {
+  if (!memo || getMemoReadDeniedStatus(memo, user, memberSpaceIds)) {
     return undefined;
   }
   return { name: `memos/${memo.uid}`, snippet: memo.content.slice(0, 120) };
@@ -259,12 +348,17 @@ async function getMemoAttachments(db: D1Database, memoId: number, memoUid: strin
   return results.map((att) => formatAttachmentEntity(att, memoUid));
 }
 
-async function getMemoRelations(db: D1Database, memoId: number, user?: UserPayload) {
+async function getMemoRelations(
+  db: D1Database,
+  memoId: number,
+  user?: UserPayload,
+  memberSpaceIds: Set<number> = new Set(),
+) {
   const relations = await listRelationsWithMemoByMemoIds(db, [memoId]);
   const resolved = relations.map((relation) => {
     const formattedRelation = {
-      memo: formatMemoRelationSnippet(relationMemoRef(relation, "memo"), user),
-      relatedMemo: formatMemoRelationSnippet(relationMemoRef(relation, "related"), user),
+      memo: formatMemoRelationSnippet(relationMemoRef(relation, "memo"), user, memberSpaceIds),
+      relatedMemo: formatMemoRelationSnippet(relationMemoRef(relation, "related"), user, memberSpaceIds),
       type: relation.type,
     };
     return formattedRelation.memo && formattedRelation.relatedMemo ? formattedRelation : undefined;
@@ -296,9 +390,10 @@ function formatShare(share: shareDB.ShareRow, memoUid: string) {
 }
 
 async function enrichMemo(db: D1Database, memo: memoDB.MemoRow, creatorUsername?: string, user?: UserPayload) {
+  const memberSpaceIds = user ? await spaceDB.getActiveSpaceIdsForUser(db, user.id) : new Set<number>();
   const [attachments, relations, reactions] = await Promise.all([
     getMemoAttachments(db, memo.id, memo.uid),
-    getMemoRelations(db, memo.id, user),
+    getMemoRelations(db, memo.id, user, memberSpaceIds),
     getMemoReactions(db, memo.uid),
   ]);
   return {
@@ -320,7 +415,7 @@ async function listAttachmentRowsByMemoIds(db: D1Database, memoIds: number[]) {
   return rows;
 }
 
-type MemoRefFields = Pick<memoDB.MemoRow, "uid" | "content" | "visibility" | "creator_id">;
+type MemoRefFields = Pick<memoDB.MemoRow, "uid" | "content" | "visibility" | "creator_id" | "row_status" | "space_id">;
 
 interface RelationWithMemoRow {
   memo_id: number;
@@ -330,16 +425,34 @@ interface RelationWithMemoRow {
   memo_content: string;
   memo_visibility: string;
   memo_creator_id: number;
+  memo_row_status: string;
+  memo_space_id: number | null;
   related_uid: string;
   related_content: string;
   related_visibility: string;
   related_creator_id: number;
+  related_row_status: string;
+  related_space_id: number | null;
 }
 
 function relationMemoRef(row: RelationWithMemoRow, side: "memo" | "related"): MemoRefFields {
   return side === "memo"
-    ? { uid: row.memo_uid, content: row.memo_content, visibility: row.memo_visibility, creator_id: row.memo_creator_id }
-    : { uid: row.related_uid, content: row.related_content, visibility: row.related_visibility, creator_id: row.related_creator_id };
+    ? {
+        uid: row.memo_uid,
+        content: row.memo_content,
+        visibility: row.memo_visibility,
+        creator_id: row.memo_creator_id,
+        row_status: row.memo_row_status,
+        space_id: row.memo_space_id,
+      }
+    : {
+        uid: row.related_uid,
+        content: row.related_content,
+        visibility: row.related_visibility,
+        creator_id: row.related_creator_id,
+        row_status: row.related_row_status,
+        space_id: row.related_space_id,
+      };
 }
 
 /** Load relations together with both endpoint memos in a single query. */
@@ -356,8 +469,10 @@ async function listRelationsWithMemoByMemoIds(db: D1Database, memoIds: number[])
       `SELECT r.type, r.memo_id, r.related_memo_id,
               source.uid AS memo_uid, source.content AS memo_content,
               source.visibility AS memo_visibility, source.creator_id AS memo_creator_id,
+              source.row_status AS memo_row_status, source.space_id AS memo_space_id,
               target.uid AS related_uid, target.content AS related_content,
-              target.visibility AS related_visibility, target.creator_id AS related_creator_id
+              target.visibility AS related_visibility, target.creator_id AS related_creator_id,
+              target.row_status AS related_row_status, target.space_id AS related_space_id
        FROM memo_relation r
        JOIN memo source ON source.id = r.memo_id
        JOIN memo target ON target.id = r.related_memo_id
@@ -431,11 +546,12 @@ async function enrichMemos(db: D1Database, memos: memoDB.MemoRow[], user?: UserP
     attachmentsByMemoId.set(att.memo_id, attachments);
   }
 
+  const relationMemberSpaceIds = user ? await spaceDB.getActiveSpaceIdsForUser(db, user.id) : new Set<number>();
   const relationsByMemoId = new Map<number, any[]>();
   for (const relation of relationRows) {
     const formattedRelation = {
-      memo: formatMemoRelationSnippet(relationMemoRef(relation, "memo"), user),
-      relatedMemo: formatMemoRelationSnippet(relationMemoRef(relation, "related"), user),
+      memo: formatMemoRelationSnippet(relationMemoRef(relation, "memo"), user, relationMemberSpaceIds),
+      relatedMemo: formatMemoRelationSnippet(relationMemoRef(relation, "related"), user, relationMemberSpaceIds),
       type: relation.type,
     };
     if (!formattedRelation.memo || !formattedRelation.relatedMemo) {
@@ -766,10 +882,20 @@ memoRoutes.post("/", authRequired, async (c) => {
   const user = c.get("user");
   const rawBody = await c.req.json();
   const body = rawBody.memo ?? rawBody;
-  const { content, visibility, createTime, updateTime, location } = body;
+  const { content, createTime, updateTime, location } = body;
+  const visibility = normalizeVisibility(body.visibility);
+  const spaceReference = body.space ?? body.spaceName;
 
   if (!content && content !== "") {
     return c.json({ error: "Content is required" }, 400);
+  }
+
+  const spaceResult = await resolveMemoSpace(c.env.DB, spaceReference, user);
+  if ("status" in spaceResult) {
+    return c.json({ code: spaceResult.status === 404 ? 5 : 3, message: spaceResult.message, details: [] }, spaceResult.status);
+  }
+  if (visibility === "SPACE" && spaceResult.spaceId === null) {
+    return c.json({ code: 3, message: "SPACE visibility requires a space", details: [] }, 400);
   }
 
   const contentLengthLimit = await getMemoContentLengthLimit(c.env.DB);
@@ -793,15 +919,17 @@ memoRoutes.post("/", authRequired, async (c) => {
   const createdTs = createTime ? Math.floor(new Date(createTime).getTime() / 1000) : undefined;
   const updatedTs = updateTime ? Math.floor(new Date(updateTime).getTime() / 1000) : undefined;
 
-  const memo = await memoDB.createMemo(c.env.DB, {
+  const created = await memoDB.createMemo(c.env.DB, {
     uid,
     creatorId: user.id,
     content: content || "",
-    visibility: visibility || "PRIVATE",
+    visibility,
     payload: JSON.stringify(payload),
     createdTs,
     updatedTs,
+    spaceId: spaceResult.spaceId,
   });
+  const memo = (await memoDB.getMemoById(c.env.DB, created.id)) || created;
 
   if (Array.isArray(body.attachments) && body.attachments.length > 0) {
     await setMemoAttachments(c.env.DB, memo.id, user, body.attachments);
@@ -845,6 +973,13 @@ memoRoutes.get("/", authOptional, async (c) => {
     rowStatus: state === "ARCHIVED" ? "ARCHIVED" : "NORMAL",
     excludeComments: true,
   };
+
+  if (state === "ARCHIVED") {
+    if (!user) {
+      return c.json({ memos: [], nextPageToken: "" });
+    }
+    opts.creatorId = user.id;
+  }
 
   if (filter) {
     try {
@@ -895,7 +1030,7 @@ memoRoutes.get("/:id", authOptional, async (c) => {
     return c.json({ error: "Memo not found" }, 404);
   }
 
-  const deniedStatus = getMemoReadDeniedStatus(memo, user);
+  const deniedStatus = await getMemoReadDeniedStatusForRequest(c.env.DB, memo, user);
   if (deniedStatus) {
     return c.json({ error: getMemoReadErrorMessage(deniedStatus) }, deniedStatus);
   }
@@ -951,7 +1086,29 @@ memoRoutes.patch("/:id", authRequired, async (c) => {
       ...(body.location ? { location: body.location } : { location: null }),
     });
   }
-  if (canUpdate("visibility") && body.visibility !== undefined) updateData.visibility = body.visibility;
+  const visibilityRequested = canUpdate("visibility") && body.visibility !== undefined;
+  const nextVisibility = visibilityRequested ? normalizeVisibility(body.visibility, memo.visibility) : memo.visibility;
+
+  let nextSpaceId = memo.space_id ?? null;
+  const spaceRequested =
+    (canUpdate("space") && body.space !== undefined) || (canUpdate("space") && body.spaceName !== undefined);
+  if (spaceRequested) {
+    const spaceResult = await resolveMemoSpace(c.env.DB, body.space ?? body.spaceName, user);
+    if ("status" in spaceResult) {
+      return c.json(
+        { code: spaceResult.status === 404 ? 5 : 3, message: spaceResult.message, details: [] },
+        spaceResult.status,
+      );
+    }
+    nextSpaceId = spaceResult.spaceId;
+    updateData.space_id = nextSpaceId;
+  }
+
+  if (nextVisibility === "SPACE" && nextSpaceId === null) {
+    return c.json({ code: 3, message: "SPACE visibility requires a space", details: [] }, 400);
+  }
+
+  if (visibilityRequested) updateData.visibility = nextVisibility;
   if (canUpdate("pinned") && body.pinned !== undefined) updateData.pinned = body.pinned ? 1 : 0;
   if (canUpdate("state") && (body.state !== undefined || body.rowStatus !== undefined)) {
     updateData.row_status = body.state ?? body.rowStatus;
@@ -959,10 +1116,11 @@ memoRoutes.patch("/:id", authRequired, async (c) => {
   if (canUpdate("createTime") && body.createTime) updateData.created_ts = Math.floor(new Date(body.createTime).getTime() / 1000);
   if (canUpdate("updateTime") && body.updateTime) updateData.updated_ts = Math.floor(new Date(body.updateTime).getTime() / 1000);
 
-  const updated = await memoDB.updateMemo(c.env.DB, memo.id, updateData);
-  if (!updated) {
+  const updatedRow = await memoDB.updateMemo(c.env.DB, memo.id, updateData);
+  if (!updatedRow) {
     return c.json({ error: "Update failed" }, 500);
   }
+  const updated = (await memoDB.getMemoById(c.env.DB, memo.id)) || updatedRow;
 
   const creatorName = memo.creator_username || (updated.creator_id === user.id ? user.username : undefined);
   await invalidateMemoDerivedCaches(c.env.CACHE, [creatorName]);
@@ -1044,7 +1202,7 @@ memoRoutes.get("/:id/relations", authOptional, async (c) => {
     ? await memoDB.getMemoById(c.env.DB, Number(id))
     : await memoDB.getMemoByUid(c.env.DB, id);
   if (!memo) return c.json({ error: "Memo not found" }, 404);
-  const deniedStatus = getMemoReadDeniedStatus(memo, user);
+  const deniedStatus = await getMemoReadDeniedStatusForRequest(c.env.DB, memo, user);
   if (deniedStatus) {
     return c.json({ error: getMemoReadErrorMessage(deniedStatus) }, deniedStatus);
   }
@@ -1113,7 +1271,7 @@ memoRoutes.post("/:id/comments", authRequired, async (c) => {
     ? await memoDB.getMemoById(c.env.DB, Number(id))
     : await memoDB.getMemoByUid(c.env.DB, id);
   if (!parentMemo) return c.json({ error: "Memo not found" }, 404);
-  const deniedStatus = getMemoReadDeniedStatus(parentMemo, user);
+  const deniedStatus = await getMemoReadDeniedStatusForRequest(c.env.DB, parentMemo, user);
   if (deniedStatus) {
     return c.json({ error: getMemoReadErrorMessage(deniedStatus) }, deniedStatus);
   }
@@ -1173,7 +1331,7 @@ memoRoutes.get("/:id/comments", authOptional, async (c) => {
     ? await memoDB.getMemoById(c.env.DB, Number(id))
     : await memoDB.getMemoByUid(c.env.DB, id);
   if (!memo) return c.json({ error: "Memo not found" }, 404);
-  const deniedStatus = getMemoReadDeniedStatus(memo, user);
+  const deniedStatus = await getMemoReadDeniedStatusForRequest(c.env.DB, memo, user);
   if (deniedStatus) {
     return c.json({ error: getMemoReadErrorMessage(deniedStatus) }, deniedStatus);
   }
@@ -1181,10 +1339,11 @@ memoRoutes.get("/:id/comments", authOptional, async (c) => {
   const relations = await relationDB.listRelations(c.env.DB, memo.id);
   const commentRelations = relations.filter((r) => r.type === "COMMENT");
   const commentMap = await getMemoRowMapByIds(c.env.DB, commentRelations.map((rel) => rel.related_memo_id));
+  const commentMemberSpaceIds = user ? await spaceDB.getActiveSpaceIdsForUser(c.env.DB, user.id) : new Set<number>();
   const comments: memoDB.MemoRow[] = [];
   for (const rel of commentRelations) {
     const comment = commentMap.get(rel.related_memo_id);
-    if (comment && !getMemoReadDeniedStatus(comment, user)) comments.push(comment);
+    if (comment && !getMemoReadDeniedStatus(comment, user, commentMemberSpaceIds)) comments.push(comment);
   }
 
   return c.json({
@@ -1202,7 +1361,7 @@ memoRoutes.get("/:id/reactions", authOptional, async (c) => {
     ? await memoDB.getMemoById(c.env.DB, Number(id))
     : await memoDB.getMemoByUid(c.env.DB, id);
   if (!memo) return c.json({ error: "Memo not found" }, 404);
-  const deniedStatus = getMemoReadDeniedStatus(memo, user);
+  const deniedStatus = await getMemoReadDeniedStatusForRequest(c.env.DB, memo, user);
   if (deniedStatus) {
     return c.json({ error: getMemoReadErrorMessage(deniedStatus) }, deniedStatus);
   }
@@ -1218,7 +1377,7 @@ memoRoutes.post("/:id/reactions", authRequired, async (c) => {
     ? await memoDB.getMemoById(c.env.DB, Number(id))
     : await memoDB.getMemoByUid(c.env.DB, id);
   if (!memo) return c.json({ error: "Memo not found" }, 404);
-  const deniedStatus = getMemoReadDeniedStatus(memo, user);
+  const deniedStatus = await getMemoReadDeniedStatusForRequest(c.env.DB, memo, user);
   if (deniedStatus) {
     return c.json({ error: getMemoReadErrorMessage(deniedStatus) }, deniedStatus);
   }
@@ -1315,7 +1474,7 @@ memoRoutes.get("/:id/attachments", authOptional, async (c) => {
     ? await memoDB.getMemoById(c.env.DB, Number(id))
     : await memoDB.getMemoByUid(c.env.DB, id);
   if (!memo) return c.json({ error: "Memo not found" }, 404);
-  const deniedStatus = getMemoReadDeniedStatus(memo, user);
+  const deniedStatus = await getMemoReadDeniedStatusForRequest(c.env.DB, memo, user);
   if (deniedStatus) {
     return c.json({ error: getMemoReadErrorMessage(deniedStatus) }, deniedStatus);
   }

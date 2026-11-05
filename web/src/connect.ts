@@ -17,6 +17,7 @@ export const memoServiceClient = {
     if (memo.updateTime) body.updateTime = timestampToISO(memo.updateTime);
     if (memo.pinned !== undefined) body.pinned = memo.pinned;
     if (memo.location) body.location = memo.location;
+    if (memo.space !== undefined) body.space = memo.space;
     return apiRequest<any>("POST", "/api/v1/memos", body);
   },
 
@@ -55,6 +56,7 @@ export const memoServiceClient = {
     if (paths.includes("create_time") && memo.createTime) body.createTime = timestampToISO(memo.createTime);
     if (paths.includes("update_time") && memo.updateTime) body.updateTime = timestampToISO(memo.updateTime);
     if (paths.includes("location") || memo.location !== undefined) body.location = memo.location;
+    if (paths.includes("space") || memo.space !== undefined) body.space = memo.space ?? null;
 
     const data = await apiRequest<any>("PATCH", `/api/v1/memos/${id}`, body);
     return normalizeMemo(data);
@@ -408,6 +410,43 @@ export const userServiceClient = {
     await apiRequest<any>("DELETE", `/api/v1/users/${username}/webhooks/${webhookId}`);
   },
 
+  async listMemoViews(req: { parent: string }) {
+    const username = extractId(req.parent, "users/");
+    const data = await apiRequest<any>("GET", `/api/v1/users/${username}/views`);
+    return { memoViews: data.memoViews || [] };
+  },
+
+  async getMemoView(req: { name: string }) {
+    const parts = req.name.split("/");
+    return apiRequest<any>("GET", `/api/v1/users/${parts[1]}/views/${parts[3]}`);
+  },
+
+  async createMemoView(req: { parent: string; memoView: any }) {
+    const username = extractId(req.parent, "users/");
+    return apiRequest<any>("POST", `/api/v1/users/${username}/views`, req.memoView);
+  },
+
+  async updateMemoView(req: { memoView: any; updateMask?: any }) {
+    const view = req.memoView || {};
+    const parts = (view.name || "").split("/");
+    const paths = req.updateMask?.paths || [];
+    const body: any = {};
+    if (paths.includes("title") || view.title !== undefined) body.title = view.title;
+    if (paths.includes("filter") || view.filter !== undefined) body.filter = view.filter;
+    if (paths.includes("icon") || view.icon !== undefined) body.icon = view.icon;
+    return apiRequest<any>("PATCH", `/api/v1/users/${parts[1]}/views/${parts[3]}`, body);
+  },
+
+  async deleteMemoView(req: { name: string }) {
+    const parts = req.name.split("/");
+    await apiRequest<any>("DELETE", `/api/v1/users/${parts[1]}/views/${parts[3]}`);
+  },
+
+  async getUserUsage(req: { name: string }) {
+    const username = extractId(req.name, "users/");
+    return apiRequest<any>("GET", `/api/v1/users/${username}/usage`);
+  },
+
   async listShortcuts(_req?: any) {
     return apiRequest<any>("GET", "/api/v1/shortcuts");
   },
@@ -669,6 +708,7 @@ function visibilityToString(v: any): string {
     case 1: return "PRIVATE";
     case 2: return "PROTECTED";
     case 3: return "PUBLIC";
+    case 4: return "SPACE";
     default: return "PRIVATE";
   }
 }
@@ -687,6 +727,7 @@ function stringToVisibility(s: string): number {
     case "PRIVATE": return 1;
     case "PROTECTED": return 2;
     case "PUBLIC": return 3;
+    case "SPACE": return 4;
     default: return 1;
   }
 }
@@ -892,12 +933,14 @@ function normalizeUserWebhook(data: any): any {
 function normalizeUserNotification(data: any): any {
   if (!data) return data;
   const statusMap: Record<string, number> = { UNREAD: 1, ARCHIVED: 2 };
-  const typeMap: Record<string, number> = { MEMO_COMMENT: 1, MEMO_MENTION: 2 };
+  const typeMap: Record<string, number> = { MEMO_COMMENT: 1, MEMO_MENTION: 2, SPACE_INVITATION: 3 };
   let payload: any = { case: undefined, value: undefined };
   if (data.memoComment) {
     payload = { case: "memoComment", value: data.memoComment };
   } else if (data.memoMention) {
     payload = { case: "memoMention", value: data.memoMention };
+  } else if (data.spaceInvitation) {
+    payload = { case: "spaceInvitation", value: data.spaceInvitation };
   } else if (data.payload?.case) {
     payload = data.payload;
   }
@@ -1119,3 +1162,92 @@ function parsePossiblyJson(value: any): any {
     return undefined;
   }
 }
+
+// ============================================================================
+// Space Service Client
+// ============================================================================
+
+function extractSpaceUid(name: string): string {
+  return extractId(name, "spaces/");
+}
+
+export const spaceServiceClient = {
+  async listSpaces(req: { pageSize?: number; pageToken?: string } = {}) {
+    const data = await apiRequest<any>("GET", `/api/v1/spaces${buildQueryString({ pageSize: req.pageSize, pageToken: req.pageToken })}`);
+    return { spaces: data.spaces || [], nextPageToken: data.nextPageToken || "" };
+  },
+
+  async getSpace(req: { name: string }) {
+    return apiRequest<any>("GET", `/api/v1/spaces/${extractSpaceUid(req.name)}`);
+  },
+
+  async createSpace(req: { space: any; spaceId?: string }) {
+    return apiRequest<any>("POST", "/api/v1/spaces", { space: req.space, spaceId: req.spaceId });
+  },
+
+  async updateSpace(req: { space: any; updateMask?: any }) {
+    const space = req.space || {};
+    const uid = extractSpaceUid(space.name);
+    const paths = req.updateMask?.paths || [];
+    const params = buildQueryString({ updateMask: paths.join(",") });
+    return apiRequest<any>("PATCH", `/api/v1/spaces/${uid}${params}`, space);
+  },
+
+  async deleteSpace(req: { name: string }) {
+    await apiRequest<any>("DELETE", `/api/v1/spaces/${extractSpaceUid(req.name)}`);
+  },
+
+  async listSpaceMembers(req: { parent: string; pageSize?: number; pageToken?: string }) {
+    const uid = extractSpaceUid(req.parent);
+    const data = await apiRequest<any>("GET", `/api/v1/spaces/${uid}/members${buildQueryString({ pageSize: req.pageSize, pageToken: req.pageToken })}`);
+    return { spaceMembers: data.spaceMembers || [], nextPageToken: data.nextPageToken || "" };
+  },
+
+  async getSpaceMember(req: { name: string }) {
+    const parts = req.name.split("/");
+    return apiRequest<any>("GET", `/api/v1/spaces/${parts[1]}/members/${parts[3]}`);
+  },
+
+  async updateSpaceMember(req: { spaceMember: any; updateMask?: any }) {
+    const member = req.spaceMember || {};
+    const parts = (member.name || "").split("/");
+    return apiRequest<any>("PATCH", `/api/v1/spaces/${parts[1]}/members/${parts[3]}`, { role: member.role });
+  },
+
+  async deleteSpaceMember(req: { name: string }) {
+    const parts = req.name.split("/");
+    await apiRequest<any>("DELETE", `/api/v1/spaces/${parts[1]}/members/${parts[3]}`);
+  },
+
+  async listSpaceInvitations(req: { parent: string; pageSize?: number; pageToken?: string }) {
+    const uid = extractSpaceUid(req.parent);
+    const data = await apiRequest<any>("GET", `/api/v1/spaces/${uid}/invitations${buildQueryString({ pageSize: req.pageSize, pageToken: req.pageToken })}`);
+    return { spaceInvitations: data.spaceInvitations || [], nextPageToken: data.nextPageToken || "" };
+  },
+
+  async createSpaceInvitation(req: { parent: string; spaceInvitation: any }) {
+    const uid = extractSpaceUid(req.parent);
+    return apiRequest<any>("POST", `/api/v1/spaces/${uid}/invitations`, req.spaceInvitation);
+  },
+
+  async deleteSpaceInvitation(req: { name: string }) {
+    const parts = req.name.split("/");
+    await apiRequest<any>("DELETE", `/api/v1/spaces/${parts[1]}/invitations/${parts[3]}`);
+  },
+
+  async acceptSpaceInvitation(req: { name: string }) {
+    const parts = req.name.split("/");
+    return apiRequest<any>("POST", `/api/v1/spaces/${parts[1]}/invitations/${parts[3]}/accept`, {});
+  },
+
+  async declineSpaceInvitation(req: { name: string }) {
+    const parts = req.name.split("/");
+    await apiRequest<any>("POST", `/api/v1/spaces/${parts[1]}/invitations/${parts[3]}/decline`, {});
+  },
+
+  async listUserSpaceInvitations(req: { parent: string }) {
+    const username = extractId(req.parent, "users/");
+    const data = await apiRequest<any>("GET", `/api/v1/users/${username}/spaceInvitations`);
+    return { spaceInvitations: data.spaceInvitations || [], nextPageToken: data.nextPageToken || "" };
+  },
+};

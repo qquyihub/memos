@@ -1,6 +1,6 @@
 # Memos on Cloudflare
 
-将 [Memos](https://github.com/usememos/memos) 笔记应用完整迁移到 Cloudflare 边缘平台，使用 Workers + D1 替代原有的 Go + SQLite + 本地存储架构；R2 / KV 为可选资源，默认仅使用 D1。
+将 [Memos](https://github.com/usememos/memos) 笔记应用完整迁移到 Cloudflare 边缘平台，使用 Workers + D1 替代原有的 Go + SQLite + 本地存储架构；R2 / KV 为可选资源，默认仅使用 D1。功能与接口对齐上游 **26.11.0**。
 
 ## 技术栈
 
@@ -146,7 +146,10 @@ npm run dev:web
 ├── scripts/
 │   └── cloudflare-deploy.mjs  # 自动创建/绑定/初始化/部署
 ├── migrations/
-│   └── 0001_initial.sql   # D1 数据库 schema
+│   ├── 0001_initial.sql   # D1 数据库 schema
+│   ├── 0002_webhooks.sql
+│   ├── 0003_performance_indexes.sql
+│   └── 0004_spaces.sql    # 协作空间、SPACE 可见性与空间放置
 ├── worker/
 │   └── src/
 │       ├── index.ts       # Hono 入口，路由挂载
@@ -160,6 +163,7 @@ npm run dev:web
 │       │   ├── instance.ts # 实例配置
 │       │   ├── ai.ts      # Workers AI 转写
 │       │   ├── idp.ts     # SSO 身份提供商
+│       │   ├── spaces.ts  # 协作空间、成员与邀请
 │       │   ├── shortcuts.ts # 快捷过滤器
 │       │   └── sse.ts     # 实时更新
 │       ├── auth/          # JWT、密码哈希、PAT
@@ -169,8 +173,8 @@ npm run dev:web
     └── src/
         ├── connect.ts     # REST 客户端（替代 Connect RPC）
         ├── contexts/      # React Context（实例、认证）
-        ├── components/    # UI 组件
-        ├── pages/         # 页面路由
+        ├── components/    # UI 组件（含 SpaceIcon、SpaceInvitationMessage）
+        ├── pages/         # 页面路由（含 Spaces、Calendar、Map、MemoViews）
         ├── locales/       # i18n 翻译文件
         └── shims/         # @bufbuild/protobuf 兼容层
 ```
@@ -212,7 +216,10 @@ npm run dev:web
 
 - Markdown 备忘录（支持标签、代码块、任务列表、Mermaid 图表）
 - 多用户支持（管理员/普通用户）
-- 备忘录可见性（私有/工作区/公开）
+- 协作空间（Spaces）：成员角色、邀请/接受/撤销、空间内备忘录
+- 备忘录可见性（私有/工作区/公开/空间）
+- 保存的筛选视图（Memo Views），支持 CEL 风格过滤表达式
+- 日历视图与备忘录地图
 - 文件附件上传（最大 100MB）
 - 备忘录分享链接（可设过期时间）
 - 备忘录评论和表情反应

@@ -14,7 +14,7 @@ import { State } from "@/types/proto/api/v1/common_pb";
 import { Memo } from "@/types/proto/api/v1/memo_service_pb";
 
 interface Props {
-  creator: string;
+  creator?: string;
   className?: string;
 }
 
@@ -47,7 +47,7 @@ const MapFitBounds = ({ memos }: { memos: Memo[] }) => {
 };
 
 const UserMemoMap = ({ creator, className }: Props) => {
-  const creatorFilter = useMemo(() => buildMemoCreatorFilter(creator), [creator]);
+  const creatorFilter = useMemo(() => (creator ? buildMemoCreatorFilter(creator) : undefined), [creator]);
 
   const { data, isLoading } = useInfiniteMemos(
     {
@@ -56,7 +56,7 @@ const UserMemoMap = ({ creator, className }: Props) => {
       pageSize: 1000,
       filter: creatorFilter,
     },
-    { enabled: Boolean(creatorFilter) },
+    { enabled: true },
   );
 
   const memosWithLocation = useMemo(() => data?.pages.flatMap((page) => page.memos).filter((memo) => memo.location) || [], [data]);

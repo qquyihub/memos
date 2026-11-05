@@ -19,6 +19,8 @@ export interface MemoEditorProps {
    * in edit mode (when `memo` is set).
    */
   defaultCreateTime?: Date;
+  /** Default space placement for a *new* memo, e.g. `spaces/team`. */
+  defaultSpace?: string;
   onConfirm?: (memoName: string) => void;
   onCancel?: () => void;
 }

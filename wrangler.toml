@@ -11,7 +11,7 @@ run_worker_first = ["/api/*", "/file/*", "/u/*", "/explore/rss.xml"]
 
 [vars]
 INSTANCE_NAME = "cfmemos"
-APP_VERSION = "1.0.0"
+APP_VERSION = "26.11.0"
 
 # 默认只使用 D1。D1 / R2 / KV 的资源名称均可通过部署变量覆盖，默认都是 memos：
 #   CFMEMOS_D1_NAME    D1 数据库名称，默认 memos

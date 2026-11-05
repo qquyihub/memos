@@ -5,6 +5,7 @@ import { useTranslate } from "@/utils/i18n";
 import { validationService } from "../services";
 import { useEditorContext } from "../state";
 import InsertMenu from "../Toolbar/InsertMenu";
+import SpaceSelector from "../Toolbar/SpaceSelector";
 import VisibilitySelector from "../Toolbar/VisibilitySelector";
 import type { EditorToolbarProps } from "../types";
 
@@ -28,6 +29,10 @@ export const EditorToolbar: FC<EditorToolbarProps> = ({ onSave, onCancel, memoNa
     dispatch(actions.setMetadata({ visibility }));
   };
 
+  const handleSpaceChange = (space?: string) => {
+    dispatch(actions.setMetadata({ space }));
+  };
+
   return (
     <div className="w-full flex flex-row justify-between items-center mb-2">
       <div className="flex flex-row justify-start items-center">
@@ -42,6 +47,7 @@ export const EditorToolbar: FC<EditorToolbarProps> = ({ onSave, onCancel, memoNa
       </div>
 
       <div className="flex flex-row justify-end items-center gap-2">
+        <SpaceSelector value={state.metadata.space} onChange={handleSpaceChange} />
         <VisibilitySelector value={state.metadata.visibility} onChange={handleVisibilityChange} />
 
         {onCancel && (

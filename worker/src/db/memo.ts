@@ -9,6 +9,8 @@ export interface MemoRow {
   visibility: string;
   pinned: number;
   payload: string;
+  space_id?: number | null;
+  space_uid?: string | null;
   creator_username?: string;
 }
 
@@ -42,29 +44,31 @@ export async function createMemo(
     createdTs?: number;
     updatedTs?: number;
     pinned?: boolean;
+    spaceId?: number | null;
   }
 ): Promise<MemoRow> {
   const payload = data.payload || "{}";
   const pinned = data.pinned ? 1 : 0;
+  const spaceId = data.spaceId ?? null;
 
   let query: string;
-  let params: (string | number)[];
+  let params: (string | number | null)[];
 
   if (data.createdTs && data.updatedTs) {
-    query = `INSERT INTO memo (uid, creator_id, content, visibility, payload, pinned, created_ts, updated_ts)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`;
-    params = [data.uid, data.creatorId, data.content, data.visibility, payload, pinned, data.createdTs, data.updatedTs];
+    query = `INSERT INTO memo (uid, creator_id, content, visibility, payload, pinned, created_ts, updated_ts, space_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`;
+    params = [data.uid, data.creatorId, data.content, data.visibility, payload, pinned, data.createdTs, data.updatedTs, spaceId];
   } else {
-    query = `INSERT INTO memo (uid, creator_id, content, visibility, payload, pinned)
-             VALUES (?, ?, ?, ?, ?, ?) RETURNING *`;
-    params = [data.uid, data.creatorId, data.content, data.visibility, payload, pinned];
+    query = `INSERT INTO memo (uid, creator_id, content, visibility, payload, pinned, space_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`;
+    params = [data.uid, data.creatorId, data.content, data.visibility, payload, pinned, spaceId];
   }
 
   return (await db.prepare(query).bind(...params).first<MemoRow>())!;
 }
 
-const MEMO_SELECT = `SELECT memo.*, user.username AS creator_username
-  FROM memo LEFT JOIN user ON user.id = memo.creator_id`;
+const MEMO_SELECT = `SELECT memo.*, user.username AS creator_username, space.uid AS space_uid
+  FROM memo LEFT JOIN user ON user.id = memo.creator_id LEFT JOIN space ON space.id = memo.space_id`;
 
 export async function getMemoByUid(
   db: D1Database,
@@ -132,8 +136,14 @@ export async function listMemos(
     params.push(...(opts.filterParams || []));
   }
   if (opts.readableByUserId !== undefined) {
-    conditions.push("(memo.visibility IN ('PUBLIC', 'PROTECTED') OR memo.creator_id = ?)");
-    params.push(opts.readableByUserId);
+    conditions.push(
+      `(memo.visibility IN ('PUBLIC', 'PROTECTED') OR memo.creator_id = ?
+        OR (memo.visibility = 'SPACE' AND EXISTS (
+          SELECT 1 FROM space_member sm JOIN user sm_user ON sm_user.id = sm.user_id AND sm_user.row_status = 'NORMAL'
+          WHERE sm.space_id = memo.space_id AND sm.user_id = ? AND sm.status = 'ACTIVE' AND sm.role IN ('ADMIN', 'USER')
+        )))`
+    );
+    params.push(opts.readableByUserId, opts.readableByUserId);
   }
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
@@ -183,10 +193,11 @@ export async function updateMemo(
     payload: string;
     created_ts: number;
     updated_ts: number;
+    space_id: number | null;
   }>
 ): Promise<MemoRow | null> {
   const fields: string[] = [];
-  const values: (string | number)[] = [];
+  const values: (string | number | null)[] = [];
 
   for (const [key, value] of Object.entries(data)) {
     if (value !== undefined) {

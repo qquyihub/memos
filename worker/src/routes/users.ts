@@ -4,7 +4,9 @@ import { authRequired, authOptional } from "../middleware/auth";
 import * as userDB from "../db/user";
 import * as settingDB from "../db/setting";
 import * as memoDB from "../db/memo";
+import * as spaceDB from "../db/space";
 import * as webhookDB from "../db/webhook";
+import { buildMemoFilterWhere } from "../filter/memo-filter";
 import { hashPassword } from "../auth/password";
 import { generatePAT, hashPAT } from "../auth/pat";
 import { exchangeOAuthCode } from "../auth/oauth";
@@ -99,7 +101,68 @@ async function buildUserSettingEntity(db: D1Database, username: string, userId: 
       generalSetting: parseSettingObject(row?.value),
     };
   }
+  if (normalizedKey === "MEMO_VIEWS") {
+    return {
+      name: `users/${username}/settings/MEMO_VIEWS`,
+      memoViewsSetting: { memoViews: await listMemoViewRecords(db, userId) },
+    };
+  }
   return { name: `users/${username}/settings/${key}` };
+}
+
+interface MemoViewRecord {
+  id: string;
+  title: string;
+  filter: string;
+  icon?: Record<string, string>;
+}
+
+function parseMemoViewIcon(input: unknown): Record<string, string> | undefined {
+  if (!input || typeof input !== "object") {
+    return undefined;
+  }
+  const icon = input as { emoji?: unknown; lucide?: unknown; case?: unknown; value?: unknown };
+  if (icon.case === "emoji" && typeof icon.value === "string") return { emoji: icon.value };
+  if (icon.case === "lucide" && typeof icon.value === "string") return { lucide: icon.value };
+  if (typeof icon.emoji === "string" && icon.emoji.trim()) return { emoji: icon.emoji.trim() };
+  if (typeof icon.lucide === "string" && icon.lucide.trim()) return { lucide: icon.lucide.trim() };
+  return undefined;
+}
+
+async function listMemoViewRecords(db: D1Database, userId: number): Promise<MemoViewRecord[]> {
+  const row = await findUserSettingRow(db, userId, "MEMO_VIEWS");
+  if (!row) return [];
+  try {
+    const parsed = JSON.parse(row.value || "{}");
+    return Array.isArray(parsed?.memoViews) ? (parsed.memoViews as MemoViewRecord[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveMemoViewRecords(db: D1Database, userId: number, records: MemoViewRecord[]): Promise<void> {
+  await settingDB.setUserSetting(db, userId, "MEMO_VIEWS", JSON.stringify({ memoViews: records }));
+}
+
+function formatMemoView(username: string, record: MemoViewRecord) {
+  return {
+    name: `users/${username}/views/${record.id}`,
+    title: record.title,
+    filter: record.filter,
+    ...(record.icon ? { icon: record.icon } : {}),
+  };
+}
+
+async function validateMemoViewFilter(db: D1Database, filter: string): Promise<string | undefined> {
+  if (!filter.trim()) {
+    return "filter cannot be empty";
+  }
+  try {
+    await buildMemoFilterWhere(db, filter);
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error.message : "invalid filter";
+  }
 }
 
 const USER_STATS_CACHE_SCOPES = ["public", "authenticated", "owner"] as const;
@@ -425,6 +488,10 @@ userRoutes.delete("/:username", authRequired, async (c) => {
   const user = await userDB.findUserByUsername(c.env.DB, username);
   if (!user) return c.json({ error: "User not found" }, 404);
 
+  if (await spaceDB.userBelongsToAnySpace(c.env.DB, user.id)) {
+    return c.json({ code: 9, message: "a user who belongs to any space cannot be deleted", details: [] }, 400);
+  }
+
   await userDB.deleteUser(c.env.DB, user.id);
   await deleteCachedKeys(c.env.CACHE, ["instance:profile", "user:stats:all", "user:stats:all:public", ...getUserStatsCacheKeys(user.username)]);
   return c.json({});
@@ -503,6 +570,190 @@ userRoutes.patch("/:username/settings/:key", authRequired, async (c) => {
 
   await settingDB.setUserSetting(c.env.DB, user.id, normalizedKey === "GENERAL" ? "GENERAL" : key, JSON.stringify(merged));
   return c.json(await buildUserSettingEntity(c.env.DB, username, user.id, key));
+});
+
+// --- Memo Views ---
+userRoutes.get("/:username/views", authRequired, async (c) => {
+  const username = c.req.param("username");
+  const currentUser = c.get("user");
+  if (username !== currentUser.username) {
+    return c.json({ code: 7, message: "permission denied", details: [] }, 403);
+  }
+  const records = await listMemoViewRecords(c.env.DB, currentUser.id);
+  return c.json({
+    memoViews: records.map((record) => formatMemoView(username, record)),
+    nextPageToken: "",
+  });
+});
+
+userRoutes.post("/:username/views", authRequired, async (c) => {
+  const username = c.req.param("username");
+  const currentUser = c.get("user");
+  if (username !== currentUser.username) {
+    return c.json({ code: 7, message: "permission denied", details: [] }, 403);
+  }
+
+  const body = await c.req.json<Record<string, unknown>>();
+  const viewInput = (body.memoView ?? body) as Record<string, unknown>;
+  const title = typeof viewInput.title === "string" ? viewInput.title.trim() : "";
+  const filter = typeof viewInput.filter === "string" ? viewInput.filter.trim() : "";
+  if (!title) {
+    return c.json({ code: 3, message: "title is required", details: [] }, 400);
+  }
+  const filterError = await validateMemoViewFilter(c.env.DB, filter);
+  if (filterError) {
+    return c.json({ code: 3, message: `invalid filter: ${filterError}`, details: [] }, 400);
+  }
+
+  const record: MemoViewRecord = {
+    id: crypto.randomUUID(),
+    title,
+    filter,
+  };
+  const icon = parseMemoViewIcon(viewInput.icon);
+  if (icon) record.icon = icon;
+
+  const records = await listMemoViewRecords(c.env.DB, currentUser.id);
+  records.push(record);
+  await saveMemoViewRecords(c.env.DB, currentUser.id, records);
+  return c.json(formatMemoView(username, record));
+});
+
+userRoutes.get("/:username/views/:viewId", authRequired, async (c) => {
+  const username = c.req.param("username");
+  const currentUser = c.get("user");
+  if (username !== currentUser.username) {
+    return c.json({ code: 7, message: "permission denied", details: [] }, 403);
+  }
+  const records = await listMemoViewRecords(c.env.DB, currentUser.id);
+  const record = records.find((item) => item.id === c.req.param("viewId"));
+  if (!record) {
+    return c.json({ code: 5, message: "memo view not found", details: [] }, 404);
+  }
+  return c.json(formatMemoView(username, record));
+});
+
+userRoutes.patch("/:username/views/:viewId", authRequired, async (c) => {
+  const username = c.req.param("username");
+  const currentUser = c.get("user");
+  if (username !== currentUser.username) {
+    return c.json({ code: 7, message: "permission denied", details: [] }, 403);
+  }
+
+  const body = await c.req.json<Record<string, unknown>>();
+  const viewInput = (body.memoView ?? body) as Record<string, unknown>;
+  const records = await listMemoViewRecords(c.env.DB, currentUser.id);
+  const index = records.findIndex((item) => item.id === c.req.param("viewId"));
+  if (index < 0) {
+    return c.json({ code: 5, message: "memo view not found", details: [] }, 404);
+  }
+
+  const current = records[index];
+  const updated: MemoViewRecord = { ...current };
+  const updateMask = c.req.query("updateMask") || c.req.query("update_mask") || "";
+  const paths = updateMask ? new Set(updateMask.split(",").map((path) => path.trim())) : undefined;
+  const canUpdate = (path: string) => !paths || paths.has(path);
+
+  if (canUpdate("title") && viewInput.title !== undefined) {
+    const title = typeof viewInput.title === "string" ? viewInput.title.trim() : "";
+    if (!title) {
+      return c.json({ code: 3, message: "title is required", details: [] }, 400);
+    }
+    updated.title = title;
+  }
+  if (canUpdate("filter") && viewInput.filter !== undefined) {
+    const filter = typeof viewInput.filter === "string" ? viewInput.filter.trim() : "";
+    const filterError = await validateMemoViewFilter(c.env.DB, filter);
+    if (filterError) {
+      return c.json({ code: 3, message: `invalid filter: ${filterError}`, details: [] }, 400);
+    }
+    updated.filter = filter;
+  }
+  if (canUpdate("icon") && viewInput.icon !== undefined) {
+    const icon = parseMemoViewIcon(viewInput.icon);
+    if (icon) updated.icon = icon;
+    else delete updated.icon;
+  }
+
+  records[index] = updated;
+  await saveMemoViewRecords(c.env.DB, currentUser.id, records);
+  return c.json(formatMemoView(username, updated));
+});
+
+userRoutes.delete("/:username/views/:viewId", authRequired, async (c) => {
+  const username = c.req.param("username");
+  const currentUser = c.get("user");
+  if (username !== currentUser.username) {
+    return c.json({ code: 7, message: "permission denied", details: [] }, 403);
+  }
+  const records = await listMemoViewRecords(c.env.DB, currentUser.id);
+  const next = records.filter((item) => item.id !== c.req.param("viewId"));
+  if (next.length === records.length) {
+    return c.json({ code: 5, message: "memo view not found", details: [] }, 404);
+  }
+  await saveMemoViewRecords(c.env.DB, currentUser.id, next);
+  return c.json({});
+});
+
+// --- Usage ---
+userRoutes.get("/:username/usage", authRequired, async (c) => {
+  const username = c.req.param("username");
+  const currentUser = c.get("user");
+  const user = await userDB.findUserByUsername(c.env.DB, username);
+  if (!user) return c.json({ code: 5, message: "user not found", details: [] }, 404);
+  if (user.id !== currentUser.id && currentUser.role !== "ADMIN") {
+    return c.json({ code: 7, message: "permission denied", details: [] }, 403);
+  }
+
+  const [memoCountRow, storageRow] = await Promise.all([
+    c.env.DB.prepare("SELECT COUNT(*) AS count FROM memo WHERE creator_id = ?").bind(user.id).first<{ count: number }>(),
+    c.env.DB.prepare("SELECT COALESCE(SUM(size), 0) AS total FROM attachment WHERE creator_id = ?").bind(user.id).first<{ total: number }>(),
+  ]);
+
+  return c.json({
+    name: `users/${username}/usage`,
+    memoCount: memoCountRow?.count ?? 0,
+    storageBytes: storageRow?.total ?? 0,
+    limits: {},
+  });
+});
+
+// --- Space Invitations ---
+userRoutes.get("/:username/spaceInvitations", authRequired, async (c) => {
+  const username = c.req.param("username");
+  const currentUser = c.get("user");
+  if (username !== currentUser.username) {
+    return c.json({ code: 7, message: "users may only list their own space invitations", details: [] }, 403);
+  }
+  const invitations = await spaceDB.listUserInvitations(c.env.DB, currentUser.id);
+  const spaceRows = new Map<number, spaceDB.SpaceRow>();
+  for (const invitation of invitations) {
+    if (!spaceRows.has(invitation.space_id)) {
+      const space = await spaceDB.getSpaceById(c.env.DB, invitation.space_id);
+      if (space) spaceRows.set(invitation.space_id, space);
+    }
+  }
+
+  return c.json({
+    spaceInvitations: invitations
+      .filter((invitation) => spaceRows.has(invitation.space_id))
+      .map((invitation) => {
+        const space = spaceRows.get(invitation.space_id)!;
+        const icon = parseSpaceNotificationIcon(space.payload);
+        return {
+          name: `spaces/${space.uid}/invitations/${invitation.username}`,
+          invitee: `users/${invitation.username}`,
+          role: invitation.role === "ADMIN" ? 1 : 2,
+          space: {
+            name: `spaces/${space.uid}`,
+            title: space.title,
+            description: space.description,
+            ...(icon ? { icon } : {}),
+          },
+        };
+      }),
+    nextPageToken: "",
+  });
 });
 
 // --- Personal Access Tokens ---
@@ -677,9 +928,24 @@ userRoutes.delete("/:username/linkedIdentities/:identityId", authRequired, async
 });
 
 // --- User Notifications ---
-function formatUserNotification(
+function parseSpaceNotificationIcon(payload: unknown): Record<string, string> | undefined {
+  if (typeof payload !== "string") return undefined;
+  try {
+    const icon = JSON.parse(payload || "{}").icon;
+    if (icon && typeof icon === "object") {
+      if (typeof icon.emoji === "string" && icon.emoji) return { emoji: icon.emoji };
+      if (typeof icon.lucide === "string" && icon.lucide) return { lucide: icon.lucide };
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+async function formatUserNotification(
+  db: D1Database,
   username: string,
-  row: { id: number; created_ts: number; sender_id: number; status: string; message: string },
+  row: { id: number; created_ts: number; sender_id: number; receiver_id: number; status: string; message: string },
   sender?: userDB.UserRow,
 ) {
   const msg = JSON.parse(row.message || "{}");
@@ -687,7 +953,9 @@ function formatUserNotification(
     ? "MEMO_MENTION"
     : msg.type === "MEMO_COMMENT"
       ? "MEMO_COMMENT"
-      : "TYPE_UNSPECIFIED";
+      : msg.type === "SPACE_INVITATION"
+        ? "SPACE_INVITATION"
+        : "TYPE_UNSPECIFIED";
 
   const notification: Record<string, any> = {
     name: `users/${username}/notifications/${row.id}`,
@@ -710,6 +978,33 @@ function formatUserNotification(
     notification.memoComment = payload;
   } else if (type === "MEMO_MENTION") {
     notification.memoMention = payload;
+  } else if (type === "SPACE_INVITATION") {
+    if (typeof msg.spaceUid !== "string" || !msg.spaceUid) {
+      return null;
+    }
+    const space = await db
+      .prepare("SELECT id, uid, title, description, payload FROM space WHERE uid = ?")
+      .bind(msg.spaceUid)
+      .first<spaceDB.SpaceRow>();
+    if (!space) {
+      return null;
+    }
+    const member = await spaceDB.getSpaceMember(db, space.id, row.receiver_id);
+    if (!member) {
+      return null;
+    }
+    const icon = parseSpaceNotificationIcon(space.payload);
+    notification.spaceInvitation = {
+      spaceInvitation: `spaces/${space.uid}/invitations/${username}`,
+      space: {
+        name: `spaces/${space.uid}`,
+        title: space.title,
+        description: space.description,
+        ...(icon ? { icon } : {}),
+      },
+      role: typeof msg.role === "number" ? msg.role : 2,
+      state: member.status === "ACTIVE" ? 2 : 1,
+    };
   }
 
   return notification;
@@ -735,9 +1030,11 @@ userRoutes.get("/:username/notifications", authRequired, async (c) => {
     senderMap.set(sender.id, sender);
   }
 
-  const notifications = (results || []).map((row) =>
-    formatUserNotification(username, row, senderMap.get(row.sender_id))
-  );
+  const notifications = (
+    await Promise.all(
+      (results || []).map((row) => formatUserNotification(c.env.DB, username, row, senderMap.get(row.sender_id))),
+    )
+  ).filter((notification) => notification !== null);
 
   return c.json({ notifications, nextPageToken: "" });
 });
@@ -766,7 +1063,7 @@ userRoutes.patch("/:username/notifications/:notifId", authRequired, async (c) =>
   if (!row) return c.json({ error: "Notification not found" }, 404);
 
   const [sender] = await userDB.findUsersByIds(c.env.DB, [row.sender_id]);
-  return c.json(formatUserNotification(username, row, sender));
+  return c.json(await formatUserNotification(c.env.DB, username, row, sender));
 });
 
 userRoutes.delete("/:username/notifications/:notifId", authRequired, async (c) => {

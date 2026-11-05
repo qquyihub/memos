@@ -27,9 +27,15 @@ function lazyWithReload<T extends React.ComponentType>(factory: () => Promise<{ 
 const AdminSignIn = lazyWithReload(() => import("@/pages/AdminSignIn"));
 const Archived = lazyWithReload(() => import("@/pages/Archived"));
 const AuthCallback = lazyWithReload(() => import("@/pages/AuthCallback"));
+const Calendar = lazyWithReload(() => import("@/pages/Calendar"));
 const Explore = lazyWithReload(() => import("@/pages/Explore"));
 const Home = lazyWithReload(() => import("@/pages/Home"));
 const Inboxes = lazyWithReload(() => import("@/pages/Inboxes"));
+const MemoMap = lazyWithReload(() => import("@/pages/Map"));
+const MemoViews = lazyWithReload(() => import("@/pages/MemoViews"));
+const MemoViewDetail = lazyWithReload(() => import("@/pages/MemoViewDetail"));
+const Spaces = lazyWithReload(() => import("@/pages/Spaces"));
+const SpaceDetail = lazyWithReload(() => import("@/pages/SpaceDetail"));
 const MemoDetail = lazyWithReload(() => import("@/pages/MemoDetail"));
 const NotFound = lazyWithReload(() => import("@/pages/NotFound"));
 const PermissionDenied = lazyWithReload(() => import("@/pages/PermissionDenied"));
@@ -81,14 +87,25 @@ export const routeConfig: RouteObject[] = [
             children: [
               { path: Routes.EXPLORE, element: <Explore /> },
               { path: "u/:username", element: <UserProfile /> },
+              { path: Routes.CALENDAR, element: <Calendar /> },
+              { path: `${Routes.CALENDAR}/:year/:month`, element: <Calendar /> },
+              { path: `${Routes.CALENDAR}/:year/:month/:day`, element: <Calendar /> },
               {
                 element: <RequireAuthRoute />,
                 children: [
                   { path: Routes.HOME, element: <Home /> },
                   { path: Routes.ARCHIVED, element: <Archived /> },
+                  { path: Routes.MAP, element: <MemoMap /> },
+                  { path: Routes.VIEWS, element: <MemoViews /> },
+                  { path: `${Routes.VIEWS}/:viewId`, element: <MemoViewDetail /> },
+                  { path: Routes.SPACES, element: <Spaces /> },
                 ],
               },
             ],
+          },
+          {
+            element: <RequireAuthRoute />,
+            children: [{ path: `${Routes.SPACES}/:spaceUid`, element: <SpaceDetail /> }],
           },
           { path: "memos/:uid", element: <MemoDetail /> },
           { path: "memos/shares/:token", element: <MemoDetail /> },

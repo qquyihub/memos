@@ -12,6 +12,7 @@ import { shortcutRoutes } from "./routes/shortcuts";
 import { idpRoutes } from "./routes/idp";
 import { aiRoutes } from "./routes/ai";
 import { sseRoutes } from "./routes/sse";
+import { spaceRoutes } from "./routes/spaces";
 import { exploreRssRoutes, rssRoutes } from "./routes/rss";
 
 const app = new Hono<{ Bindings: Env }>();
@@ -78,6 +79,7 @@ app.route("/api/v1/memos", memoRoutes);
 app.route("/api/v1/users", userRoutes);
 app.route("/api/v1/attachments", attachmentRoutes);
 app.route("/api/v1/instance", instanceRoutes);
+app.route("/api/v1/spaces", spaceRoutes);
 app.route("/api/v1/health", healthRoutes);
 app.route("/api/v1/identity-providers", idpRoutes);
 app.route("/api/v1/sse", sseRoutes);
