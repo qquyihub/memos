@@ -56,10 +56,22 @@ interface RawStorageSetting {
 interface EditableStorageSetting {
   storageType: StorageType;
   filepathTemplate: string;
+  uploadSizeLimitMb: number;
   imageProcessing: ImageProcessingSetting;
   s3: S3Config;
   webdav: WebDAVConfig;
 }
+
+const DEFAULT_UPLOAD_SIZE_LIMIT_MB = 100;
+const MAX_UPLOAD_SIZE_LIMIT_MB = 100;
+
+const normalizeUploadSizeLimit = (value: unknown): number => {
+  const limit = Number(value);
+  if (!Number.isFinite(limit) || limit <= 0) {
+    return DEFAULT_UPLOAD_SIZE_LIMIT_MB;
+  }
+  return Math.min(Math.round(limit), MAX_UPLOAD_SIZE_LIMIT_MB);
+};
 
 const normalizeStorageType = (value: unknown): StorageType => {
   if (typeof value === "number") {
@@ -89,6 +101,7 @@ const normalizeImageProcessing = (raw: Partial<ImageProcessingSetting> | undefin
 const deriveStorageSetting = (raw: RawStorageSetting): EditableStorageSetting => ({
   storageType: normalizeStorageType(raw.storageType),
   filepathTemplate: raw.filepathTemplate ?? "",
+  uploadSizeLimitMb: normalizeUploadSizeLimit(raw.uploadSizeLimitMb),
   imageProcessing: normalizeImageProcessing(raw.imageProcessing),
   s3: {
     endpoint: raw.s3Config?.endpoint ?? "",
@@ -159,7 +172,7 @@ const StorageSection = () => {
           case: "storageSetting",
           value: {
             storageType: config.storageType,
-            uploadSizeLimitMb: Number(rawSetting.uploadSizeLimitMb ?? 100),
+            uploadSizeLimitMb: normalizeUploadSizeLimit(config.uploadSizeLimitMb),
             filepathTemplate: config.filepathTemplate.trim(),
             imageProcessing: {
               enabled: config.imageProcessing.enabled,
@@ -220,10 +233,30 @@ const StorageSection = () => {
         </SettingRow>
       </SettingGroup>
 
-      <SettingGroup
-        title={t("setting.storage.image-preprocessing")}
-        description={t("setting.storage.image-preprocessing-description")}
-      >
+      <SettingGroup title={t("setting.storage.upload-size-limit")} description={t("setting.storage.upload-size-limit-description")}>
+        <SettingRow label={t("setting.storage.upload-size-limit")} description={t("setting.storage.upload-size-limit-hint")}>
+          <div className="flex items-center gap-2">
+            <Input
+              className="w-full sm:w-32"
+              type="number"
+              min={1}
+              max={MAX_UPLOAD_SIZE_LIMIT_MB}
+              step={1}
+              value={config.uploadSizeLimitMb}
+              onChange={(event) => {
+                const value = Number(event.target.value);
+                setConfig((prev) => ({
+                  ...prev,
+                  uploadSizeLimitMb: Number.isFinite(value) ? value : prev.uploadSizeLimitMb,
+                }));
+              }}
+            />
+            <span className="text-sm text-muted-foreground">MiB</span>
+          </div>
+        </SettingRow>
+      </SettingGroup>
+
+      <SettingGroup title={t("setting.storage.image-preprocessing")} description={t("setting.storage.image-preprocessing-description")}>
         <SettingRow
           label={t("setting.storage.image-preprocessing-enabled")}
           description={t("setting.storage.image-preprocessing-enabled-description")}
@@ -237,10 +270,7 @@ const StorageSection = () => {
         </SettingRow>
         {config.imageProcessing.enabled && (
           <>
-            <SettingRow
-              label={t("setting.storage.compress-images")}
-              description={t("setting.storage.compress-images-description")}
-            >
+            <SettingRow label={t("setting.storage.compress-images")} description={t("setting.storage.compress-images-description")}>
               <Switch
                 checked={config.imageProcessing.compress}
                 onCheckedChange={(checked) =>

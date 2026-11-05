@@ -157,7 +157,7 @@ export async function getUploadPolicy(db: D1Database): Promise<UploadPolicy> {
 
     return {
       filepathTemplate: template || DEFAULT_FILEPATH_TEMPLATE,
-      uploadSizeLimitMb: limit > 0 ? limit : DEFAULT_MAX_UPLOAD_SIZE_MB,
+      uploadSizeLimitMb: limit > 0 ? Math.min(Math.round(limit), DEFAULT_MAX_UPLOAD_SIZE_MB) : DEFAULT_MAX_UPLOAD_SIZE_MB,
       imageProcessing: normalizeImageProcessing(parsed.imageProcessing),
     };
   } catch {
