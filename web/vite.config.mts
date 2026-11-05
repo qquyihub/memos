@@ -48,6 +48,11 @@ export default defineConfig({
   },
   build: {
     rollupOptions: {
+      // Rollup 默认会并发打开最多 1000 个文件（maxParallelFileOps 默认值），
+      // 接近 Cloudflare Workers Builds 容器的文件句柄上限（1024），会触发
+      // EMFILE，并被 Rollup 误报为 “failed to resolve import xxx”。
+      // 降低并发读取数量即可在受限环境中稳定构建。
+      maxParallelFileOps: 64,
       output: {
         manualChunks: {
           "router-vendor": ["react-router-dom"],

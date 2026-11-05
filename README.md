@@ -317,9 +317,11 @@ npm run db:migrate:remote   # 远程 D1（等价于 npm run cf:init）
 
 ## 常见问题
 
-**Q: 构建时报 `EMFILE: too many open files`？**
+**Q: 构建时报 `EMFILE: too many open files`，或 `Rollup failed to resolve import "xxx"`？**
 
-KaTeX 的 CSS 与 woff2 字体已改为 `web/public/katex` 静态资源，不再由 Vite 并发解析 60 个字体文件；`npm run build` / `build:web` 也会尝试提高进程文件句柄上限。请拉取最新代码并清除构建缓存后重试。
+两者通常是同一个原因：Cloudflare Workers Builds 的构建容器文件句柄上限较低（常见为 1024），而 Rollup 4 默认 `maxParallelFileOps` 为 1000，构建时会并发打开接近上限的文件，触发 `EMFILE`，随后被 Rollup 误报为某个已安装依赖“无法解析”。
+
+`web/vite.config.mts` 已将 `build.rollupOptions.maxParallelFileOps` 限制为 64（构建峰值句柄数约 100），可在 256 句柄的受限环境中正常完成构建。KaTeX 的 CSS 与 woff2 字体也已改为 `web/public/katex` 静态资源，避免 Vite 并发解析大量字体文件。若仍失败，请确认拉取的是最新代码并清除构建缓存。
 
 **Q: 部署后访问显示空白页？**
 
