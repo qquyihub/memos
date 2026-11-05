@@ -317,6 +317,10 @@ npm run db:migrate:remote   # 远程 D1（等价于 npm run cf:init）
 
 ## 常见问题
 
+**Q: 构建时报 `EMFILE: too many open files`？**
+
+KaTeX 的 CSS 与 woff2 字体已改为 `web/public/katex` 静态资源，不再由 Vite 并发解析 60 个字体文件；`npm run build` / `build:web` 也会尝试提高进程文件句柄上限。请拉取最新代码并清除构建缓存后重试。
+
 **Q: 部署后访问显示空白页？**
 
 确认 `web/dist/` 已生成。`npm run build` 或 `npm run cf:deploy` 会构建前端；`wrangler deploy` 会自动上传该目录。
