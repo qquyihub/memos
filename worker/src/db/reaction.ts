@@ -47,6 +47,16 @@ export async function upsertReaction(
   return result;
 }
 
+export async function getReactionById(
+  db: D1Database,
+  id: number
+): Promise<ReactionRow | null> {
+  return db
+    .prepare("SELECT * FROM reaction WHERE id = ?")
+    .bind(id)
+    .first<ReactionRow>();
+}
+
 export async function deleteReaction(
   db: D1Database,
   id: number,

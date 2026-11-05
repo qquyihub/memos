@@ -29,11 +29,19 @@ export interface AttachmentRow {
   storage_type: string;
   reference: string;
   payload: string;
+  external_link?: string;
 }
 
 const nowTs = () => Math.floor(Date.now() / 1000);
 
 function formatAttachment(att: AttachmentRow, memoUid?: string | null) {
+  let motionMedia: unknown;
+  try {
+    motionMedia = att.payload ? JSON.parse(att.payload).motionMedia : undefined;
+  } catch {
+    motionMedia = undefined;
+  }
+
   return {
     name: `attachments/${att.uid}`,
     createTime: new Date(att.created_ts * 1000).toISOString(),
@@ -41,6 +49,8 @@ function formatAttachment(att: AttachmentRow, memoUid?: string | null) {
     type: att.type,
     size: String(att.size),
     ...(memoUid ? { memo: `memos/${memoUid}` } : {}),
+    ...(att.external_link ? { externalLink: att.external_link } : {}),
+    ...(motionMedia ? { motionMedia } : {}),
   };
 }
 
@@ -224,6 +234,7 @@ attachmentRoutes.post("/", authRequired, async (c) => {
   let fileType: string;
   let fileData: ArrayBuffer;
   let memoId: number | null = null;
+  let motionMedia: unknown;
 
   if (contentType.includes("multipart/form-data")) {
     const formData = await c.req.formData();
@@ -241,6 +252,14 @@ attachmentRoutes.post("/", authRequired, async (c) => {
     filename = file.name;
     fileType = file.type;
     fileData = await file.arrayBuffer();
+    const rawMotionMedia = formData.get("motionMedia")?.toString();
+    if (rawMotionMedia) {
+      try {
+        motionMedia = JSON.parse(rawMotionMedia);
+      } catch {
+        motionMedia = undefined;
+      }
+    }
     const resolvedMemo = await resolveWritableMemoId(c.env.DB, user, formData.get("memo")?.toString() || null);
     if ("error" in resolvedMemo) return c.json({ error: resolvedMemo.error }, resolvedMemo.status);
     memoId = resolvedMemo.memoId;
@@ -249,6 +268,7 @@ attachmentRoutes.post("/", authRequired, async (c) => {
     const attachment = body.attachment || body;
     filename = attachment.filename || "unnamed";
     fileType = attachment.type || "application/octet-stream";
+    motionMedia = attachment.motionMedia;
     const resolvedMemo = await resolveWritableMemoId(c.env.DB, user, attachment.memo);
     if ("error" in resolvedMemo) return c.json({ error: resolvedMemo.error }, resolvedMemo.status);
     memoId = resolvedMemo.memoId;
@@ -284,11 +304,12 @@ attachmentRoutes.post("/", authRequired, async (c) => {
   await storage.put(objectKey, fileData, fileType);
 
   // Store metadata in D1
+  const payload = motionMedia ? JSON.stringify({ motionMedia }) : "{}";
   const att = await c.env.DB.prepare(
-    `INSERT INTO attachment (uid, creator_id, created_ts, updated_ts, filename, type, size, memo_id, storage_type, reference)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
+    `INSERT INTO attachment (uid, creator_id, created_ts, updated_ts, filename, type, size, memo_id, storage_type, reference, payload)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
   )
-    .bind(uid, user.id, createdTs, createdTs, filename, fileType, fileData.byteLength, memoId, storageConfig.storageType, objectKey)
+    .bind(uid, user.id, createdTs, createdTs, filename, fileType, fileData.byteLength, memoId, storageConfig.storageType, objectKey, payload)
     .first<AttachmentRow>();
 
   await deleteCachedKeys(c.env.CACHE, ["instance:stats"]);

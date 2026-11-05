@@ -1,7 +1,11 @@
 import * as webhookDB from "./db/webhook";
 import type { UserPayload } from "./types";
 
-export type MemoWebhookEventType = "memo.created" | "memo.updated" | "memo.deleted";
+export type MemoWebhookEventType =
+  | "memos.memo.created"
+  | "memos.memo.updated"
+  | "memos.memo.deleted"
+  | "memos.memo.comment.created";
 
 interface MemoWebhookActor {
   id: number;
@@ -9,12 +13,15 @@ interface MemoWebhookActor {
   role?: string;
 }
 
-interface DeliverMemoWebhookEventOptions {
+interface DeliverMemoWebhookOptions {
   db: D1Database;
   creatorId: number;
-  eventType: MemoWebhookEventType;
   memo: unknown;
   actor?: MemoWebhookActor;
+}
+
+interface DeliverMemoWebhookEventOptions extends DeliverMemoWebhookOptions {
+  eventType: MemoWebhookEventType;
 }
 
 const MAX_WEBHOOK_URL_LENGTH = 2048;
@@ -78,23 +85,27 @@ export function getWebhookUrlValidationError(rawUrl: string | undefined): string
   return undefined;
 }
 
-function getActorPayload(actor: MemoWebhookActor | undefined) {
-  if (!actor) {
-    return undefined;
-  }
-  return {
-    id: actor.id,
-    name: `users/${actor.username}`,
-    username: actor.username,
-    role: actor.role,
-  };
+function getCreatorName(actor: MemoWebhookActor | undefined): string {
+  return actor ? `users/${actor.username}` : "";
 }
 
-function buildMemoWebhookPayload(eventType: MemoWebhookEventType, memo: unknown, actor?: MemoWebhookActor) {
+/**
+ * Build the same payload shape as upstream `webhook.WebhookRequestPayload`:
+ * `{ url, activityType, creator, memo }`.
+ */
+function buildMemoWebhookPayload(
+  url: string,
+  eventType: MemoWebhookEventType,
+  memo: unknown,
+  actor?: MemoWebhookActor,
+) {
+  const memoCreator = memo && typeof memo === "object" && typeof (memo as { creator?: unknown }).creator === "string"
+    ? (memo as { creator: string }).creator
+    : "";
   return {
-    type: eventType,
-    createdAt: new Date().toISOString(),
-    actor: getActorPayload(actor),
+    url,
+    activityType: eventType,
+    creator: memoCreator || getCreatorName(actor),
     memo,
   };
 }
@@ -115,8 +126,7 @@ async function postWebhook(webhook: webhookDB.WebhookRow, payload: unknown) {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "user-agent": "cfmemos-webhook/1.0",
-        "x-memos-event": (payload as { type?: string }).type || "",
+        "user-agent": "memos-webhook/1.0",
         "x-memos-delivery": deliveryId,
         "x-memos-webhook-id": String(webhook.id),
       },
@@ -134,14 +144,29 @@ async function postWebhook(webhook: webhookDB.WebhookRow, payload: unknown) {
   }
 }
 
-export async function deliverMemoWebhookEvent(options: DeliverMemoWebhookEventOptions): Promise<void> {
+async function deliverWebhookEvent(
+  options: DeliverMemoWebhookOptions,
+  eventType: MemoWebhookEventType,
+): Promise<void> {
   const webhooks = await webhookDB.listWebhooksByCreatorId(options.db, options.creatorId);
   if (webhooks.length === 0) {
     return;
   }
 
-  const payload = buildMemoWebhookPayload(options.eventType, options.memo, options.actor);
-  await Promise.all(webhooks.map((webhook) => postWebhook(webhook, payload)));
+  await Promise.all(
+    webhooks.map((webhook) => {
+      const payload = buildMemoWebhookPayload(webhook.url, eventType, options.memo, options.actor);
+      return postWebhook(webhook, payload);
+    }),
+  );
+}
+
+export async function deliverMemoWebhookEvent(options: DeliverMemoWebhookEventOptions): Promise<void> {
+  await deliverWebhookEvent(options, options.eventType);
+}
+
+export async function deliverMemoCommentWebhook(options: DeliverMemoWebhookOptions): Promise<void> {
+  await deliverWebhookEvent(options, "memos.memo.comment.created");
 }
 
 export function getWebhookActor(user: UserPayload): MemoWebhookActor {

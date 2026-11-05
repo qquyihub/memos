@@ -5,12 +5,20 @@ import * as memoDB from "../db/memo";
 import * as relationDB from "../db/relation";
 import * as reactionDB from "../db/reaction";
 import * as shareDB from "../db/share";
+import * as userDB from "../db/user";
 import * as settingDB from "../db/setting";
 import { createErrorBody } from "../error";
 import { deleteCachedKeys, getCachedJson, putCachedJson, sha256Hex } from "../cache";
 import { deleteStoredObjects } from "../storage";
 import { buildMemoFilterWhere, MemoFilterError } from "../filter/memo-filter";
-import { deliverMemoWebhookEvent, getWebhookActor, type MemoWebhookEventType } from "../webhook";
+import {
+  buildMemoSnippet,
+  extractMemoPayloadData,
+  extractMentions,
+  type MemoPayloadData,
+} from "../markdown";
+import { deliverMemoCommentWebhook, deliverMemoWebhookEvent, getWebhookActor, type MemoWebhookEventType } from "../webhook";
+import { publishMemoEvent } from "../events";
 
 type MemoApp = { Bindings: Env; Variables: { user: UserPayload } };
 type MemoContext = Context<MemoApp>;
@@ -122,41 +130,16 @@ function emptyLinkMetadata(url?: string): LinkMetadata {
   };
 }
 
-function parseMemoPayload(content: string) {
-  const tags: string[] = [];
-  const tagRegex = /#([a-zA-Z0-9_一-鿿぀-ゟ゠-ヿ/\-]+)/g;
-  let match;
-  while ((match = tagRegex.exec(content)) !== null) {
-    tags.push(match[1]);
-  }
-
-  const hasLink = /https?:\/\/[^\s]+/.test(content);
-  const hasTaskList = /- \[[ x]\]/.test(content);
-  const hasCode = /```[\s\S]*?```/.test(content) || /`[^`]+`/.test(content);
-  const hasIncompleteTask = /- \[ \]/.test(content);
-
-  const lines = content.split("\n");
-  let title = "";
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed) {
-      title = trimmed.replace(/^#+\s*/, "").slice(0, 100);
-      break;
-    }
-  }
-
-  return {
-    tags,
-    property: { hasLink, hasTaskList, hasCode, hasIncompleteTask, title },
-  };
-}
-
-function buildMemoSnippet(content: string, limit = 200): string {
-  return content.replace(/\s+/g, " ").trim().slice(0, limit);
+function parseMemoPayload(content: string): Pick<MemoPayloadData, "tags" | "property"> {
+  const { tags, property } = extractMemoPayloadData(content);
+  return { tags, property };
 }
 
 function formatMemo(memo: memoDB.MemoRow, creatorUsername?: string) {
   const payload = JSON.parse(memo.payload || "{}");
+  if (payload.property && payload.property.hasIncompleteTasks === undefined && payload.property.hasIncompleteTask !== undefined) {
+    payload.property.hasIncompleteTasks = Boolean(payload.property.hasIncompleteTask);
+  }
   return {
     name: `memos/${memo.uid}`,
     state: memo.row_status === "ARCHIVED" ? "ARCHIVED" : "NORMAL",
@@ -192,11 +175,101 @@ function formatMemoRelationSnippet(memo: Pick<memoDB.MemoRow, "uid" | "content" 
   if (!memo || getMemoReadDeniedStatus(memo, user)) {
     return undefined;
   }
-  return { name: `memos/${memo.uid}`, snippet: memo.content.slice(0, 120) };
+  return { name: `memos/${memo.uid}`, snippet: buildMemoSnippet(memo.content) };
 }
 
 function createPlaceholders(count: number) {
   return Array.from({ length: count }, () => "?").join(", ");
+}
+
+function encodeVarint(value: number): number[] {
+  const bytes: number[] = [];
+  let remaining = Math.max(0, Math.trunc(value));
+  while (remaining >= 0x80) {
+    bytes.push((remaining & 0x7f) | 0x80);
+    remaining = Math.floor(remaining / 128);
+  }
+  bytes.push(remaining);
+  return bytes;
+}
+
+/** Encode a page token the same way upstream `marshalPageToken` does. */
+function encodePageToken(limit: number, offset: number): string {
+  // protobuf PageToken{limit=1 int32, offset=2 int32}
+  const bytes = [0x08, ...encodeVarint(limit), 0x10, ...encodeVarint(offset)];
+  return btoa(String.fromCharCode(...bytes));
+}
+
+function decodeVarint(bytes: number[], start: number): { value: number; next: number } | undefined {
+  let value = 0;
+  let shift = 0;
+  let index = start;
+  while (index < bytes.length) {
+    const byte = bytes[index];
+    value |= (byte & 0x7f) << shift;
+    index += 1;
+    if ((byte & 0x80) === 0) {
+      return { value, next: index };
+    }
+    shift += 7;
+    if (shift > 28) {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function decodePageToken(token: string): { limit?: number; offset: number } {
+  try {
+    const decoded = atob(token);
+    // Legacy local format: base64 of the numeric offset.
+    if (/^\d+$/.test(decoded)) {
+      return { offset: Math.max(0, Number(decoded)) };
+    }
+    // Legacy JSON format.
+    if (decoded.startsWith("{")) {
+      const parsed = JSON.parse(decoded) as { limit?: unknown; offset?: unknown };
+      return {
+        limit: typeof parsed.limit === "number" ? parsed.limit : undefined,
+        offset: typeof parsed.offset === "number" && Number.isFinite(parsed.offset) ? Math.max(0, Math.trunc(parsed.offset)) : 0,
+      };
+    }
+    // Upstream protobuf format.
+    const bytes = Array.from(decoded, (char) => char.charCodeAt(0));
+    let cursor = 0;
+    let limit: number | undefined;
+    let offset = 0;
+    while (cursor < bytes.length) {
+      const tag = bytes[cursor++];
+      const field = tag >> 3;
+      const value = decodeVarint(bytes, cursor);
+      if (!value) break;
+      cursor = value.next;
+      if (field === 1) limit = value.value;
+      if (field === 2) offset = value.value;
+    }
+    return { limit, offset: Math.max(0, offset) };
+  } catch {
+    return { offset: 0 };
+  }
+}
+
+function validateMemoOrderBy(orderBy: string): string | undefined {
+  if (!orderBy.trim()) {
+    return undefined;
+  }
+  for (const field of orderBy.split(",")) {
+    const parts = field.trim().split(/\s+/).filter(Boolean);
+    if (parts.length === 0) continue;
+    const name = parts[0];
+    if (!["pinned", "create_time", "update_time", "name"].includes(name)) {
+      return `unsupported order field: ${name}, supported fields are: pinned, create_time, update_time, name`;
+    }
+    if (parts.length > 1 && !["asc", "desc"].includes(parts[1].toLowerCase())) {
+      return `invalid order direction: ${parts[1]}, must be 'asc' or 'desc'`;
+    }
+  }
+  return undefined;
 }
 
 function chunkValues<T>(values: T[], size: number): T[][] {
@@ -500,6 +573,107 @@ function enqueueMemoWebhook(
   );
 }
 
+interface MentionMemoContext {
+  uid: string;
+  creator_id: number;
+  visibility: string;
+  content: string;
+}
+
+async function resolveMentionTargets(db: D1Database, content: string) {
+  const usernames = extractMentions(content);
+  if (usernames.length === 0) {
+    return [];
+  }
+  const users = await userDB.findUsersByUsernames(db, usernames);
+  return users.filter((user) => user.row_status === "NORMAL");
+}
+
+function shouldSkipMentionInbox(
+  target: userDB.UserRow,
+  memo: MentionMemoContext,
+  relatedMemo?: MentionMemoContext,
+): boolean {
+  if (target.id === memo.creator_id) {
+    return true;
+  }
+  // Comment creation already notifies the parent creator separately.
+  if (relatedMemo && target.id === relatedMemo.creator_id && memo.visibility !== "PRIVATE" && memo.creator_id !== relatedMemo.creator_id) {
+    return true;
+  }
+  if (relatedMemo && relatedMemo.visibility === "PRIVATE" && target.id !== relatedMemo.creator_id) {
+    return true;
+  }
+  return memo.visibility === "PRIVATE" && target.id !== memo.creator_id;
+}
+
+async function getParentMemoContext(
+  db: D1Database,
+  memo: Pick<memoDB.MemoRow, "payload">,
+): Promise<{ uid: string; creator_id: number; visibility: string } | undefined> {
+  try {
+    const parentName = JSON.parse(memo.payload || "{}").parent;
+    if (typeof parentName !== "string" || !parentName.startsWith("memos/")) {
+      return undefined;
+    }
+    const parentUid = parentName.slice("memos/".length);
+    const parent = await db.prepare("SELECT uid, creator_id, visibility FROM memo WHERE uid = ?")
+      .bind(parentUid)
+      .first<{ uid: string; creator_id: number; visibility: string }>();
+    return parent ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function publishMemoUpdatedEvent(db: D1Database, memo: memoDB.MemoRow): Promise<void> {
+  const parent = await getParentMemoContext(db, memo);
+  await publishMemoEvent(db, {
+    type: "memo.updated",
+    name: `memos/${memo.uid}`,
+    parent: parent ? `memos/${parent.uid}` : undefined,
+    visibility: memo.visibility,
+    creatorId: parent?.creator_id ?? memo.creator_id,
+  });
+}
+
+async function dispatchMentionNotifications(
+  db: D1Database,
+  memo: MentionMemoContext,
+  relatedMemo?: MentionMemoContext,
+  previousContent = "",
+): Promise<void> {
+  const currentTargets = await resolveMentionTargets(db, memo.content);
+  if (currentTargets.length === 0) {
+    return;
+  }
+
+  const previousTargets = previousContent ? await resolveMentionTargets(db, previousContent) : [];
+  const previousTargetIds = new Set(previousTargets.map((user) => user.id));
+
+  for (const target of currentTargets) {
+    if (previousTargetIds.has(target.id) || shouldSkipMentionInbox(target, memo, relatedMemo)) {
+      continue;
+    }
+
+    const message = JSON.stringify({
+      type: "MEMO_MENTION",
+      memo: `memos/${memo.uid}`,
+      ...(relatedMemo ? { relatedMemo: `memos/${relatedMemo.uid}` } : {}),
+      memoSnippet: buildMemoSnippet(memo.content),
+      ...(relatedMemo ? { relatedMemoSnippet: buildMemoSnippet(relatedMemo.content) } : {}),
+    });
+
+    try {
+      await db.prepare(
+        "INSERT INTO inbox (sender_id, receiver_id, status, message) VALUES (?, ?, ?, ?)"
+      ).bind(memo.creator_id, target.id, "UNREAD", message).run();
+    } catch (error) {
+      console.warn("Failed to create mention inbox notification", error);
+    }
+  }
+}
+
 function getAttachmentReference(value: unknown): string {
   if (typeof value === "string") {
     return value;
@@ -743,8 +917,23 @@ async function resolveAttachmentIds(db: D1Database, user: UserPayload, reference
   return ids;
 }
 
-async function setMemoAttachments(db: D1Database, memoId: number, user: UserPayload, references: unknown[]) {
+async function setMemoAttachments(env: Env, memoId: number, user: UserPayload, references: unknown[]) {
+  const db = env.DB;
   const attachmentIds = await resolveAttachmentIds(db, user, references);
+  const keepIds = new Set(attachmentIds);
+
+  // Upstream `setMemoAttachmentsInternal` removes attachments that are no
+  // longer part of the requested set instead of leaving them orphaned.
+  const { results: previousAttachments } = await db.prepare(
+    "SELECT id, reference, storage_type FROM attachment WHERE memo_id = ?"
+  ).bind(memoId).all<{ id: number; reference: string; storage_type: string }>();
+  const removedAttachments = previousAttachments.filter((attachment) => !keepIds.has(attachment.id));
+  if (removedAttachments.length > 0) {
+    await deleteStoredObjects(env, db, removedAttachments);
+    await db.prepare(
+      `DELETE FROM attachment WHERE id IN (${createPlaceholders(removedAttachments.length)})`
+    ).bind(...removedAttachments.map((attachment) => attachment.id)).run();
+  }
 
   const statements: D1PreparedStatement[] = [
     db.prepare("UPDATE attachment SET memo_id = NULL WHERE memo_id = ?").bind(memoId),
@@ -757,8 +946,32 @@ async function setMemoAttachments(db: D1Database, memoId: number, user: UserPayl
         : db.prepare(`UPDATE attachment SET memo_id = ? WHERE id IN (${placeholders}) AND creator_id = ?`).bind(memoId, ...chunk, user.id),
     );
   }
+  statements.push(db.prepare("UPDATE memo SET updated_ts = strftime('%s', 'now') WHERE id = ?").bind(memoId));
 
   await db.batch(statements);
+}
+
+async function setMemoRelations(
+  db: D1Database,
+  memo: memoDB.MemoRow,
+  relations: Array<{ memo?: { name?: string }; relatedMemo?: { name?: string }; relatedMemoId?: number; type?: string | number }>,
+): Promise<void> {
+  const normalized: { relatedMemoId: number; type: string }[] = [];
+  for (const relation of relations || []) {
+    let relatedToken: unknown = relation.relatedMemoId;
+    if (relation.memo?.name || relation.relatedMemo?.name) {
+      const memoName = relation.memo?.name;
+      const relatedName = relation.relatedMemo?.name;
+      relatedToken = memoName === `memos/${memo.uid}` ? relatedName : memoName;
+    }
+    const relatedMemoId = await resolveMemoIdByToken(db, relatedToken);
+    if (!relatedMemoId || relatedMemoId === memo.id) continue;
+    normalized.push({ relatedMemoId, type: normalizeRelationType(relation.type) });
+  }
+  // COMMENT relations are managed by comment creation/deletion, never by the client.
+  const referenceRelations = normalized.filter((relation) => relation.type !== "COMMENT");
+  await relationDB.setRelations(db, memo.id, referenceRelations);
+  await db.prepare("UPDATE memo SET updated_ts = strftime('%s', 'now') WHERE id = ?").bind(memo.id).run();
 }
 
 // Create memo
@@ -804,45 +1017,50 @@ memoRoutes.post("/", authRequired, async (c) => {
   });
 
   if (Array.isArray(body.attachments) && body.attachments.length > 0) {
-    await setMemoAttachments(c.env.DB, memo.id, user, body.attachments);
+    await setMemoAttachments(c.env, memo.id, user, body.attachments);
   }
 
   await invalidateMemoDerivedCaches(c.env.CACHE, [user.username]);
   const enrichedMemo = await enrichMemo(c.env.DB, memo, user.username, user);
-  enqueueMemoWebhook(c, "memo.created", memo.creator_id, enrichedMemo, user);
+  enqueueMemoWebhook(c, "memos.memo.created", memo.creator_id, enrichedMemo, user);
+  await dispatchMentionNotifications(c.env.DB, memo);
+  await publishMemoEvent(c.env.DB, {
+    type: "memo.created",
+    name: `memos/${memo.uid}`,
+    visibility: memo.visibility,
+    creatorId: memo.creator_id,
+  });
   return c.json(enrichedMemo);
 });
 
 // List memos
 memoRoutes.get("/", authOptional, async (c) => {
   const user = c.get("user");
-  const pageSize = Math.max(1, Math.min(Number(c.req.query("pageSize")) || 50, 1000));
+  const rawPageSize = Math.max(1, Math.min(Number(c.req.query("pageSize")) || 10, 1000));
   const pageToken = c.req.query("pageToken");
   const filter = c.req.query("filter") || "";
   const orderBy = c.req.query("orderBy") || "";
   const state = c.req.query("state") || "NORMAL";
+  const isArchived = state === "ARCHIVED";
 
-  let offset = 0;
-  if (pageToken) {
-    try {
-      const decoded = atob(pageToken);
-      const numericOffset = Number(decoded);
-      if (Number.isFinite(numericOffset)) {
-        offset = Math.max(0, Math.trunc(numericOffset));
-      } else {
-        const parsed = JSON.parse(decoded) as { offset?: unknown };
-        if (typeof parsed.offset === "number" && Number.isFinite(parsed.offset)) {
-          offset = Math.max(0, Math.trunc(parsed.offset));
-        }
-      }
-    } catch { /* invalid token, start from 0 */ }
+  if (isArchived && !user) {
+    return c.json({ memos: [], nextPageToken: "" });
   }
+
+  const orderByError = validateMemoOrderBy(orderBy);
+  if (orderByError) {
+    return c.json(createErrorBody(`invalid order_by: ${orderByError}`, { errorKey: "message.invalid-memo-order-by" }), 400);
+  }
+
+  const decodedToken = pageToken ? decodePageToken(pageToken) : undefined;
+  const pageSize = Math.max(1, Math.min(decodedToken?.limit || rawPageSize, 1000));
+  const offset = decodedToken?.offset ?? 0;
 
   const opts: memoDB.ListMemosOpts = {
     pageSize,
     offset,
     orderBy,
-    rowStatus: state === "ARCHIVED" ? "ARCHIVED" : "NORMAL",
+    rowStatus: isArchived ? "ARCHIVED" : "NORMAL",
     excludeComments: true,
   };
 
@@ -863,7 +1081,9 @@ memoRoutes.get("/", authOptional, async (c) => {
     }
   }
 
-  if (!user) {
+  if (isArchived) {
+    opts.creatorId = user!.id;
+  } else if (!user) {
     opts.visibility = "PUBLIC";
   } else {
     opts.readableByUserId = user.id;
@@ -871,7 +1091,7 @@ memoRoutes.get("/", authOptional, async (c) => {
 
   const { memos, hasNext } = await memoDB.listMemos(c.env.DB, opts);
 
-  const nextPageToken = hasNext ? btoa(String(offset + pageSize)) : "";
+  const nextPageToken = hasNext ? encodePageToken(pageSize, offset + pageSize) : "";
 
   return c.json({
     memos: await enrichMemos(c.env.DB, memos, user),
@@ -927,8 +1147,10 @@ memoRoutes.patch("/:id", authRequired, async (c) => {
   const rawUpdateMask = c.req.query("updateMask") || c.req.query("update_mask") || "";
   const updateMask = rawUpdateMask ? new Set(rawUpdateMask.split(",").map((field) => field.trim()).filter(Boolean)) : undefined;
   const canUpdate = (field: string) => !updateMask || updateMask.has(field);
+  let previousContent = "";
 
   if (canUpdate("content") && body.content !== undefined) {
+    previousContent = memo.content;
     const contentLengthLimit = await getMemoContentLengthLimit(c.env.DB);
     if (contentLengthLimit > 0 && getUtf8ByteLength(body.content) > contentLengthLimit) {
       return c.json(
@@ -964,10 +1186,29 @@ memoRoutes.patch("/:id", authRequired, async (c) => {
     return c.json({ error: "Update failed" }, 500);
   }
 
+  if (canUpdate("attachments") && Array.isArray(body.attachments)) {
+    await setMemoAttachments(c.env, memo.id, user, body.attachments);
+  }
+  if (canUpdate("relations") && Array.isArray(body.relations)) {
+    await setMemoRelations(c.env.DB, memo, body.relations);
+  }
+
+  const refreshed = (await memoDB.getMemoById(c.env.DB, memo.id)) ?? updated;
   const creatorName = memo.creator_username || (updated.creator_id === user.id ? user.username : undefined);
   await invalidateMemoDerivedCaches(c.env.CACHE, [creatorName]);
-  const enrichedMemo = await enrichMemo(c.env.DB, updated, creatorName, user);
-  enqueueMemoWebhook(c, "memo.updated", updated.creator_id, enrichedMemo, user);
+  if (previousContent) {
+    await dispatchMentionNotifications(c.env.DB, refreshed, undefined, previousContent);
+  }
+  const enrichedMemo = await enrichMemo(c.env.DB, refreshed, creatorName, user);
+  enqueueMemoWebhook(c, "memos.memo.updated", updated.creator_id, enrichedMemo, user);
+  const parent = await getParentMemoContext(c.env.DB, refreshed);
+  await publishMemoEvent(c.env.DB, {
+    type: "memo.updated",
+    name: `memos/${refreshed.uid}`,
+    parent: parent ? `memos/${parent.uid}` : undefined,
+    visibility: refreshed.visibility,
+    creatorId: parent?.creator_id ?? refreshed.creator_id,
+  });
   return c.json(enrichedMemo);
 });
 
@@ -992,6 +1233,7 @@ memoRoutes.delete("/:id", authRequired, async (c) => {
 
   const creatorName = memo.creator_username || (memo.creator_id === user.id ? user.username : undefined);
   const deletedMemo = await enrichMemo(c.env.DB, memo, creatorName, user);
+  const parent = await getParentMemoContext(c.env.DB, memo);
 
   // Delete the memo together with its comment subtree and all derived rows.
   // R2/S3 blobs are removed first, then the database rows are cleaned in one
@@ -1032,7 +1274,14 @@ memoRoutes.delete("/:id", authRequired, async (c) => {
   }
 
   await invalidateMemoDerivedCaches(c.env.CACHE, [creatorName]);
-  enqueueMemoWebhook(c, "memo.deleted", memo.creator_id, deletedMemo, user);
+  enqueueMemoWebhook(c, "memos.memo.deleted", memo.creator_id, deletedMemo, user);
+  await publishMemoEvent(c.env.DB, {
+    type: "memo.deleted",
+    name: `memos/${memo.uid}`,
+    parent: parent ? `memos/${parent.uid}` : undefined,
+    visibility: memo.visibility,
+    creatorId: parent?.creator_id ?? memo.creator_id,
+  });
   return c.json({});
 });
 
@@ -1089,19 +1338,8 @@ memoRoutes.patch("/:id/relations", authRequired, async (c) => {
   const body = await c.req.json<{
     relations?: Array<{ memo?: { name?: string }; relatedMemo?: { name?: string }; relatedMemoId?: number; type?: string | number }>;
   }>();
-  const relations: { relatedMemoId: number; type: string }[] = [];
-  for (const relation of body.relations || []) {
-    let relatedToken: unknown = relation.relatedMemoId;
-    if (relation.memo?.name || relation.relatedMemo?.name) {
-      const memoName = relation.memo?.name;
-      const relatedName = relation.relatedMemo?.name;
-      relatedToken = memoName === `memos/${memo.uid}` ? relatedName : memoName;
-    }
-    const relatedMemoId = await resolveMemoIdByToken(c.env.DB, relatedToken);
-    if (!relatedMemoId) continue;
-    relations.push({ relatedMemoId, type: normalizeRelationType(relation.type) });
-  }
-  await relationDB.setRelations(c.env.DB, memo.id, relations);
+  await setMemoRelations(c.env.DB, memo, body.relations || []);
+  await publishMemoUpdatedEvent(c.env.DB, memo);
   return c.json({});
 });
 
@@ -1130,7 +1368,7 @@ memoRoutes.post("/:id/comments", authRequired, async (c) => {
     uid,
     creatorId: user.id,
     content: body.content || "",
-    visibility: body.visibility || parentMemo.visibility,
+    visibility: body.visibility || "PRIVATE",
     payload: JSON.stringify({
       ...payload,
       parent: `memos/${parentMemo.uid}`,
@@ -1138,7 +1376,7 @@ memoRoutes.post("/:id/comments", authRequired, async (c) => {
   });
 
   if (Array.isArray(body.attachments) && body.attachments.length > 0) {
-    await setMemoAttachments(c.env.DB, comment.id, user, body.attachments);
+    await setMemoAttachments(c.env, comment.id, user, body.attachments);
   }
 
   await relationDB.createRelation(c.env.DB, {
@@ -1147,13 +1385,13 @@ memoRoutes.post("/:id/comments", authRequired, async (c) => {
     type: "COMMENT",
   });
 
-  if (parentMemo.creator_id !== user.id) {
+  if (comment.visibility !== "PRIVATE" && parentMemo.creator_id !== user.id) {
     const message = JSON.stringify({
       type: "MEMO_COMMENT",
       memo: `memos/${comment.uid}`,
       relatedMemo: `memos/${parentMemo.uid}`,
-      memoSnippet: comment.content.slice(0, 150),
-      relatedMemoSnippet: parentMemo.content.slice(0, 150),
+      memoSnippet: buildMemoSnippet(comment.content),
+      relatedMemoSnippet: buildMemoSnippet(parentMemo.content),
     });
     await c.env.DB.prepare(
       "INSERT INTO inbox (sender_id, receiver_id, status, message) VALUES (?, ?, ?, ?)"
@@ -1162,7 +1400,21 @@ memoRoutes.post("/:id/comments", authRequired, async (c) => {
 
   await invalidateMemoDerivedCaches(c.env.CACHE, [user.username]);
   const enrichedComment = await enrichMemo(c.env.DB, comment, user.username, user);
-  enqueueMemoWebhook(c, "memo.created", comment.creator_id, enrichedComment, user);
+  c.executionCtx.waitUntil(
+    deliverMemoCommentWebhook({
+      db: c.env.DB,
+      creatorId: parentMemo.creator_id,
+      memo: enrichedComment,
+      actor: getWebhookActor(user),
+    }),
+  );
+  await dispatchMentionNotifications(c.env.DB, comment, parentMemo);
+  await publishMemoEvent(c.env.DB, {
+    type: "memo.comment.created",
+    name: `memos/${parentMemo.uid}`,
+    visibility: parentMemo.visibility,
+    creatorId: parentMemo.creator_id,
+  });
   return c.json(enrichedComment);
 });
 
@@ -1236,6 +1488,14 @@ memoRoutes.post("/:id/reactions", authRequired, async (c) => {
     contentId: memo.uid,
     reactionType,
   });
+  const parent = await getParentMemoContext(c.env.DB, memo);
+  await publishMemoEvent(c.env.DB, {
+    type: "reaction.upserted",
+    name: `memos/${memo.uid}`,
+    parent: parent ? `memos/${parent.uid}` : undefined,
+    visibility: memo.visibility,
+    creatorId: parent?.creator_id ?? memo.creator_id,
+  });
   return c.json(formatReaction(reaction, user.username));
 });
 
@@ -1243,7 +1503,24 @@ memoRoutes.delete("/:id/reactions/:reactionId", authRequired, async (c) => {
   const reactionId = Number(c.req.param("reactionId"));
   const user = c.get("user");
 
-  await reactionDB.deleteReaction(c.env.DB, reactionId, user.id);
+  const reaction = await reactionDB.getReactionById(c.env.DB, reactionId);
+  if (!reaction || (reaction.creator_id !== user.id && user.role !== "ADMIN")) {
+    // 403 instead of 404 to avoid revealing whether the reaction exists.
+    return c.json({ error: "Permission denied" }, 403);
+  }
+
+  await reactionDB.deleteReaction(c.env.DB, reactionId, reaction.creator_id);
+  const memo = await memoDB.getMemoByUid(c.env.DB, reaction.content_id);
+  if (memo) {
+    const parent = await getParentMemoContext(c.env.DB, memo);
+    await publishMemoEvent(c.env.DB, {
+      type: "reaction.deleted",
+      name: `memos/${memo.uid}`,
+      parent: parent ? `memos/${parent.uid}` : undefined,
+      visibility: memo.visibility,
+      creatorId: parent?.creator_id ?? memo.creator_id,
+    });
+  }
   return c.json({});
 });
 
@@ -1283,10 +1560,14 @@ memoRoutes.post("/:id/shares", authRequired, async (c) => {
   const expiresTs = memoShare.expireTime
     ? Math.floor(new Date(memoShare.expireTime).getTime() / 1000)
     : rawBody.expiresTs;
+  if (typeof expiresTs === "number" && Number.isFinite(expiresTs) && expiresTs <= Math.floor(Date.now() / 1000)) {
+    return c.json({ error: "expire_time must be in the future" }, 400);
+  }
+  const normalizedExpiresTs = typeof expiresTs === "number" && Number.isFinite(expiresTs) ? expiresTs : undefined;
   const share = await shareDB.createShare(c.env.DB, {
     memoId: memo.id,
     creatorId: user.id,
-    expiresTs,
+    expiresTs: normalizedExpiresTs,
   });
   return c.json(formatShare(share, memo.uid));
 });
@@ -1336,7 +1617,8 @@ memoRoutes.patch("/:id/attachments", authRequired, async (c) => {
   }
 
   const body = await c.req.json<{ attachmentIds?: Array<number | string>; attachments?: unknown[] }>();
-  await setMemoAttachments(c.env.DB, memo.id, user, body.attachments || body.attachmentIds || []);
+  await setMemoAttachments(c.env, memo.id, user, body.attachments || body.attachmentIds || []);
+  await publishMemoUpdatedEvent(c.env.DB, memo);
 
   return c.json({});
 });
@@ -1370,17 +1652,15 @@ shareRoutes.get("/shares/:shareId", authOptional, async (c) => {
   const token = c.req.param("shareId");
   const share = await shareDB.getShareByUid(c.env.DB, token);
 
-  if (!share) {
-    return c.json({ error: "Share not found" }, 404);
-  }
-
-  if (share.expires_ts && share.expires_ts < Math.floor(Date.now() / 1000)) {
-    return c.json({ error: "Share expired" }, 410);
+  // Invalid, expired, and archived shares deliberately look identical so
+  // callers cannot probe for existence, matching upstream `GetMemoByShare`.
+  if (!share || (share.expires_ts && share.expires_ts < Math.floor(Date.now() / 1000))) {
+    return c.json({ error: "not found" }, 404);
   }
 
   const memo = await memoDB.getMemoById(c.env.DB, share.memo_id);
-  if (!memo) {
-    return c.json({ error: "Memo not found" }, 404);
+  if (!memo || memo.row_status === "ARCHIVED") {
+    return c.json({ error: "not found" }, 404);
   }
 
   return c.json(await enrichMemo(c.env.DB, memo, memo.creator_username));

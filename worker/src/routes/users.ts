@@ -11,6 +11,7 @@ import { exchangeOAuthCode } from "../auth/oauth";
 import { createErrorBody } from "../error";
 import { buildIdentityProviderName, extractIdentityProviderUid } from "../idp";
 import { deleteCachedKeys, getCachedJson, putCachedJson } from "../cache";
+import { deleteStoredObjects } from "../storage";
 import { getWebhookUrlValidationError, normalizeWebhookUrl } from "../webhook";
 
 type UserApp = { Bindings: Env; Variables: { user: UserPayload } };
@@ -99,6 +100,20 @@ async function buildUserSettingEntity(db: D1Database, username: string, userId: 
       generalSetting: parseSettingObject(row?.value),
     };
   }
+  if (normalizedKey === "SHORTCUTS") {
+    const row = await findUserSettingRow(db, userId, "shortcuts");
+    let shortcuts: unknown[] = [];
+    try {
+      const parsed = row ? JSON.parse(row.value) : [];
+      shortcuts = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      shortcuts = [];
+    }
+    return {
+      name: `users/${username}/settings/SHORTCUTS`,
+      shortcutsSetting: { shortcuts },
+    };
+  }
   return { name: `users/${username}/settings/${key}` };
 }
 
@@ -128,12 +143,14 @@ function appendStatsVisibilityFilter(conditions: string[], targetUserId: number,
   return scope;
 }
 
-// List users
-userRoutes.get("/", authOptional, async (c) => {
+// List users (admin only, matching upstream ListUsers)
+userRoutes.get("/", authRequired, async (c) => {
   const currentUser = c.get("user");
-  const includeEmail = currentUser?.role === "ADMIN";
+  if (currentUser.role !== "ADMIN") {
+    return c.json({ error: "Permission denied" }, 403);
+  }
   const users = await userDB.listUsers(c.env.DB, { rowStatus: "NORMAL" });
-  return c.json({ users: users.map((user) => formatUser(user, { includeEmail })), nextPageToken: "", totalSize: users.length });
+  return c.json({ users: users.map((user) => formatUser(user, { includeEmail: true })), nextPageToken: "", totalSize: users.length });
 });
 
 async function buildUserStats(
@@ -301,6 +318,9 @@ userRoutes.post("/", async (c) => {
     if (!username || !password) {
       return c.json({ error: "Username and password required" }, 400);
     }
+    if (!/^[a-zA-Z0-9_-]{1,64}$/.test(username) || /^\d+$/.test(username)) {
+      return c.json({ error: `invalid username ${username}` }, 400);
+    }
 
     const passwordHash = await hashPassword(password);
     const user = await userDB.createUser(c.env.DB, { username, passwordHash, role: "ADMIN" });
@@ -338,6 +358,9 @@ userRoutes.post("/", async (c) => {
   if (!username || !password) {
     return c.json({ error: "Username and password required" }, 400);
   }
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(username) || /^\d+$/.test(username)) {
+    return c.json({ error: `invalid username ${username}` }, 400);
+  }
 
   const existing = await userDB.findUserByUsername(c.env.DB, username);
   if (existing) return c.json({ error: "Username taken" }, 409);
@@ -370,7 +393,7 @@ userRoutes.patch("/:username", authRequired, async (c) => {
   const generalSetting = await getGeneralSetting(c.env.DB);
 
   if (body.nickname !== undefined || body.displayName !== undefined) {
-    if (user.id === currentUser.id && currentUser.role !== "ADMIN" && generalSetting.disallowChangeNickname === true) {
+    if (generalSetting.disallowChangeNickname === true) {
       return c.json(createErrorBody("Changing nickname is disabled", { errorKey: "message.nickname-change-disabled" }), 403);
     }
     updateData.nickname = body.nickname ?? body.displayName;
@@ -386,18 +409,24 @@ userRoutes.patch("/:username", authRequired, async (c) => {
     }
     if (body.state !== undefined) updateData.row_status = body.state;
   }
-  if (body.rowStatus !== undefined) updateData.row_status = body.rowStatus;
-  if (body.username !== undefined) {
-    if (currentUser.role === "ADMIN") {
-      updateData.username = body.username;
-    } else if (user.id === currentUser.id) {
-      if (generalSetting.disallowChangeUsername === true) {
-        return c.json(createErrorBody("Changing username is disabled", { errorKey: "message.username-change-disabled" }), 403);
-      }
-      if (body.username !== user.username) {
-        return c.json(createErrorBody("Changing username requires admin privileges", { errorKey: "message.username-change-admin-only" }), 403);
-      }
+  if (body.rowStatus !== undefined) {
+    if (currentUser.role !== "ADMIN") {
+      return c.json({ error: "Permission denied" }, 403);
     }
+    updateData.row_status = body.rowStatus;
+  }
+  if (body.username !== undefined && body.username !== user.username) {
+    if (generalSetting.disallowChangeUsername === true) {
+      return c.json(createErrorBody("Changing username is disabled", { errorKey: "message.username-change-disabled" }), 403);
+    }
+    if (currentUser.role !== "ADMIN" && user.id === currentUser.id) {
+      return c.json(createErrorBody("Changing username requires admin privileges", { errorKey: "message.username-change-admin-only" }), 403);
+    }
+    const username = String(body.username);
+    if (!/^[a-zA-Z0-9_-]{1,64}$/.test(username) || /^\d+$/.test(username)) {
+      return c.json({ error: `invalid username ${username}` }, 400);
+    }
+    updateData.username = username;
   }
 
   const updated = await userDB.updateUser(c.env.DB, user.id, updateData);
@@ -414,18 +443,108 @@ userRoutes.patch("/:username", authRequired, async (c) => {
 });
 
 // Delete user
+function createPlaceholders(count: number) {
+  return Array.from({ length: count }, () => "?").join(", ");
+}
+
+function chunkValues<T>(values: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
+}
+
+/**
+ * Deletes a user together with everything they own, mirroring upstream
+ * `DeleteUserCompletely`: the user's memo tree (including comments on their
+ * memos), attachments and stored files, reactions, share links, inbox rows,
+ * identities, settings, and webhooks.
+ */
+async function deleteUserCompletely(env: Env, userId: number): Promise<void> {
+  const db = env.DB;
+  const { results: memoRows } = await db.prepare(
+    `WITH RECURSIVE memo_tree(id) AS (
+       SELECT id FROM memo WHERE creator_id = ?
+       UNION
+       SELECT child.id
+       FROM memo child
+       JOIN memo_relation rel ON rel.memo_id = child.id AND rel.type = 'COMMENT'
+       JOIN memo_tree parent ON rel.related_memo_id = parent.id
+     )
+     SELECT memo.id AS id, memo.uid AS uid FROM memo_tree JOIN memo ON memo.id = memo_tree.id`
+  ).bind(userId).all<{ id: number; uid: string }>();
+
+  const memoIds = memoRows.map((row) => row.id);
+  const memoUids = memoRows.map((row) => row.uid);
+
+  const attachmentsById = new Map<number, { id: number; reference: string; storage_type: string }>();
+  for (const chunk of chunkValues(memoIds, 400)) {
+    const { results } = await db.prepare(
+      `SELECT id, reference, storage_type FROM attachment WHERE memo_id IN (${createPlaceholders(chunk.length)})`
+    ).bind(...chunk).all<{ id: number; reference: string; storage_type: string }>();
+    for (const attachment of results) {
+      attachmentsById.set(attachment.id, attachment);
+    }
+  }
+  const { results: ownedAttachments } = await db.prepare(
+    "SELECT id, reference, storage_type FROM attachment WHERE creator_id = ?"
+  ).bind(userId).all<{ id: number; reference: string; storage_type: string }>();
+  for (const attachment of ownedAttachments) {
+    attachmentsById.set(attachment.id, attachment);
+  }
+
+  const attachments = [...attachmentsById.values()];
+  await deleteStoredObjects(env, db, attachments);
+
+  const attachmentIds = attachments.map((attachment) => attachment.id);
+  const contentIds = memoUids.map((uid) => uid);
+
+  for (const chunk of chunkValues(memoIds, 400)) {
+    const placeholders = createPlaceholders(chunk.length);
+    await db.batch([
+      db.prepare(`DELETE FROM memo_relation WHERE memo_id IN (${placeholders}) OR related_memo_id IN (${placeholders})`).bind(...chunk, ...chunk),
+      db.prepare(`DELETE FROM memo_share WHERE memo_id IN (${placeholders})`).bind(...chunk),
+      db.prepare(`DELETE FROM memo WHERE id IN (${placeholders})`).bind(...chunk),
+    ]);
+  }
+
+  for (const chunk of chunkValues(attachmentIds, 400)) {
+    await db.prepare(`DELETE FROM attachment WHERE id IN (${createPlaceholders(chunk.length)})`).bind(...chunk).run();
+  }
+
+  for (const chunk of chunkValues(contentIds, 400)) {
+    const placeholders = createPlaceholders(chunk.length);
+    await db.batch([
+      db.prepare(`DELETE FROM reaction WHERE content_id IN (${placeholders})`).bind(...chunk),
+      db.prepare(
+        `DELETE FROM inbox WHERE ${chunk.map((uid) => "message LIKE ?").join(" OR ")}`
+      ).bind(...chunk.map((uid) => `%"memos/${uid}"%`)),
+    ]);
+  }
+
+  await db.batch([
+    db.prepare("DELETE FROM reaction WHERE creator_id = ?").bind(userId),
+    db.prepare("DELETE FROM memo_share WHERE creator_id = ?").bind(userId),
+    db.prepare("DELETE FROM inbox WHERE sender_id = ? OR receiver_id = ?").bind(userId, userId),
+    db.prepare("DELETE FROM user_identity WHERE user_id = ?").bind(userId),
+    db.prepare("DELETE FROM user_setting WHERE user_id = ?").bind(userId),
+    db.prepare("DELETE FROM webhook WHERE creator_id = ?").bind(userId),
+    db.prepare("DELETE FROM user WHERE id = ?").bind(userId),
+  ]);
+}
+
 userRoutes.delete("/:username", authRequired, async (c) => {
   const username = c.req.param("username");
   const currentUser = c.get("user");
 
-  if (currentUser.role !== "ADMIN") {
-    return c.json({ error: "Admin only" }, 403);
-  }
-
   const user = await userDB.findUserByUsername(c.env.DB, username);
   if (!user) return c.json({ error: "User not found" }, 404);
+  if (currentUser.id !== user.id && currentUser.role !== "ADMIN") {
+    return c.json({ error: "Permission denied" }, 403);
+  }
 
-  await userDB.deleteUser(c.env.DB, user.id);
+  await deleteUserCompletely(c.env, user.id);
   await deleteCachedKeys(c.env.CACHE, ["instance:profile", "user:stats:all", "user:stats:all:public", ...getUserStatsCacheKeys(user.username)]);
   return c.json({});
 });
@@ -436,12 +555,13 @@ userRoutes.get("/:username/settings", authRequired, async (c) => {
   const currentUser = c.get("user");
   const user = await userDB.findUserByUsername(c.env.DB, username);
   if (!user) return c.json({ error: "User not found" }, 404);
-  if (user.id !== currentUser.id && currentUser.role !== "ADMIN") {
+  if (user.id !== currentUser.id) {
     return c.json({ error: "Permission denied" }, 403);
   }
 
   const settings = await Promise.all([
     buildUserSettingEntity(c.env.DB, username, user.id, "GENERAL"),
+    buildUserSettingEntity(c.env.DB, username, user.id, "SHORTCUTS"),
     buildUserSettingEntity(c.env.DB, username, user.id, "WEBHOOKS"),
   ]);
   return c.json({ settings, nextPageToken: "", totalSize: settings.length });
@@ -453,7 +573,7 @@ userRoutes.get("/:username/settings/:key", authRequired, async (c) => {
   const currentUser = c.get("user");
   const user = await userDB.findUserByUsername(c.env.DB, username);
   if (!user) return c.json({ error: "User not found" }, 404);
-  if (user.id !== currentUser.id && currentUser.role !== "ADMIN") {
+  if (user.id !== currentUser.id) {
     return c.json({ error: "Permission denied" }, 403);
   }
 
@@ -466,7 +586,7 @@ userRoutes.patch("/:username/settings/:key", authRequired, async (c) => {
   const currentUser = c.get("user");
   const user = await userDB.findUserByUsername(c.env.DB, username);
   if (!user) return c.json({ error: "User not found" }, 404);
-  if (user.id !== currentUser.id && currentUser.role !== "ADMIN") {
+  if (user.id !== currentUser.id) {
     return c.json({ error: "Permission denied" }, 403);
   }
 
@@ -605,6 +725,27 @@ userRoutes.get("/:username/linkedIdentities", authRequired, async (c) => {
   return c.json({ linkedIdentities });
 });
 
+userRoutes.get("/:username/linkedIdentities/:identityId", authRequired, async (c) => {
+  const username = c.req.param("username");
+  const currentUser = c.get("user");
+  const user = await userDB.findUserByUsername(c.env.DB, username);
+  if (!user) return c.json({ error: "User not found" }, 404);
+  if (user.id !== currentUser.id && currentUser.role !== "ADMIN") {
+    return c.json({ error: "Permission denied" }, 403);
+  }
+
+  const row = await c.env.DB.prepare(
+    "SELECT * FROM user_identity WHERE id = ? AND user_id = ?"
+  ).bind(c.req.param("identityId"), user.id).first<{ id: number; provider: string; extern_uid: string }>();
+  if (!row) return c.json({ error: "Linked identity not found" }, 404);
+
+  return c.json({
+    name: `users/${username}/linkedIdentities/${row.id}`,
+    idpName: buildIdentityProviderName(row.provider),
+    externUid: row.extern_uid,
+  });
+});
+
 userRoutes.post("/:username/linkedIdentities", authRequired, async (c) => {
   const username = c.req.param("username");
   const currentUser = c.get("user");
@@ -720,7 +861,7 @@ userRoutes.get("/:username/notifications", authRequired, async (c) => {
   const currentUser = c.get("user");
   const user = await userDB.findUserByUsername(c.env.DB, username);
   if (!user) return c.json({ error: "User not found" }, 404);
-  if (user.id !== currentUser.id && currentUser.role !== "ADMIN") {
+  if (user.id !== currentUser.id) {
     return c.json({ error: "Permission denied" }, 403);
   }
 
@@ -746,7 +887,7 @@ userRoutes.patch("/:username/notifications/:notifId", authRequired, async (c) =>
   const username = c.req.param("username");
   const notifId = Number(c.req.param("notifId"));
   const currentUser = c.get("user");
-  if (username !== currentUser.username && currentUser.role !== "ADMIN") {
+  if (username !== currentUser.username) {
     return c.json({ error: "Permission denied" }, 403);
   }
 

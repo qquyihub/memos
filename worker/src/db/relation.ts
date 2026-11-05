@@ -40,8 +40,10 @@ export async function setRelations(
   memoId: number,
   relations: { relatedMemoId: number; type: string }[]
 ): Promise<void> {
+  // COMMENT relations are owned by the comment lifecycle and must survive
+  // relation edits, matching upstream `setMemoRelationsInternal`.
   const statements: D1PreparedStatement[] = [
-    db.prepare("DELETE FROM memo_relation WHERE memo_id = ?").bind(memoId),
+    db.prepare("DELETE FROM memo_relation WHERE memo_id = ? AND type = 'REFERENCE'").bind(memoId),
   ];
 
   for (const chunk of chunkValues(relations, 300)) {

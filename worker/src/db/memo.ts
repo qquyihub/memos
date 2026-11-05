@@ -144,14 +144,19 @@ export async function listMemos(
     const parts = opts.orderBy.split(",").map((p) => p.trim());
     for (const part of parts) {
       const [field, dir] = part.split(" ");
-      const col = field === "create_time" ? "created_ts" : field === "update_time" ? "updated_ts" : field;
+      const col =
+        field === "create_time" || field === "name" ? "created_ts"
+          : field === "update_time" ? "updated_ts"
+            : field;
       if (allowedOrderColumns.has(col)) {
-        orderParts.push(`memo.${col} ${dir?.toUpperCase() === "ASC" ? "ASC" : "DESC"}`);
+        // `pinned` is always DESC (true first), matching upstream.
+        const direction = col === "pinned" ? "DESC" : dir?.toUpperCase() === "ASC" ? "ASC" : "DESC";
+        orderParts.push(`memo.${col} ${direction}`);
       }
     }
   }
   if (orderParts.length === 0) {
-    orderParts.push("memo.pinned DESC", "memo.created_ts DESC");
+    orderParts.push("memo.created_ts DESC");
   }
   // Stable ordering for pagination when timestamps tie.
   if (!orderParts.some((part) => part.startsWith("memo.id "))) {
