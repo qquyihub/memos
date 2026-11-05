@@ -3,19 +3,51 @@ import { getCookie } from "hono/cookie";
 import type { Env, UserPayload } from "../types";
 import { authOptional } from "../middleware/auth";
 import { verifyRefreshToken } from "../auth/jwt";
+import { findActiveUserPayload } from "../auth/user";
 import * as shareDB from "../db/share";
+import * as spaceDB from "../db/space";
 import { createStorageBackend, getStorageConfig, normalizeStorageType } from "../storage";
 
 type FileApp = { Bindings: Env; Variables: { user: UserPayload } };
 
 export const fileRoutes = new Hono<FileApp>();
 
-const UNSAFE_MIME_TYPES = new Set([
-  "text/html",
-  "text/xml",
-  "image/svg+xml",
-  "application/xhtml+xml",
+const INLINE_MIME_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "image/avif",
+  "image/bmp",
+  "image/x-icon",
+  "image/vnd.microsoft.icon",
+  "audio/aac",
+  "audio/flac",
+  "audio/mp4",
+  "audio/mpeg",
+  "audio/ogg",
+  "audio/wav",
+  "audio/webm",
+  "audio/x-m4a",
+  "audio/x-wav",
+  "video/mp4",
+  "video/mpeg",
+  "video/ogg",
+  "video/quicktime",
+  "video/webm",
+  "application/pdf",
+  "text/plain",
 ]);
+
+function getDownloadDisposition(filename: string): string {
+  // A fixed ASCII fallback plus an encoded UTF-8 name keeps stored filenames
+  // out of header syntax, including quotes, control characters and backslashes.
+  const wellFormedFilename = new TextDecoder().decode(new TextEncoder().encode(filename));
+  const encodedFilename = encodeURIComponent(wellFormedFilename).replace(/[!'()*]/g, (character) =>
+    `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+  return `attachment; filename="download"; filename*=UTF-8''${encodedFilename}`;
+}
 
 function parseRangeHeader(rangeHeader: string | undefined, totalSize: number) {
   if (!rangeHeader || totalSize <= 0) {
@@ -68,12 +100,7 @@ const resolveUserFromRequest = async (c: { req: { header: (name: string) => stri
 
   try {
     const claims = await verifyRefreshToken(refreshToken, c.env.JWT_SECRET);
-    return {
-      id: Number(claims.sub),
-      username: claims.name,
-      role: claims.role,
-      status: claims.status,
-    };
+    return await findActiveUserPayload(c.env.DB, claims.sub);
   } catch {
     return undefined;
   }
@@ -95,7 +122,6 @@ async function hasValidShareTokenForAttachment(db: D1Database, token: string | u
 // Serve attachment file
 fileRoutes.get("/attachments/:uid/:filename", authOptional, async (c) => {
   const uid = c.req.param("uid");
-  const filename = c.req.param("filename");
 
   const att = await c.env.DB.prepare(
     "SELECT * FROM attachment WHERE uid = ?"
@@ -104,15 +130,19 @@ fileRoutes.get("/attachments/:uid/:filename", authOptional, async (c) => {
   if (!att) return c.notFound();
 
   let cacheControl = "private, no-store";
-  const hasShareAccess = await hasValidShareTokenForAttachment(c.env.DB, c.req.query("share_token") || c.req.query("shareToken"), att.memo_id);
+  let hasShareAccess = await hasValidShareTokenForAttachment(c.env.DB, c.req.query("share_token") || c.req.query("shareToken"), att.memo_id);
 
   // Check visibility via memo
   if (att.memo_id) {
     const memo = await c.env.DB.prepare(
-      "SELECT visibility, creator_id FROM memo WHERE id = ?"
-    ).bind(att.memo_id).first<{ visibility: string; creator_id: number }>();
+      "SELECT visibility, creator_id, space_id FROM memo WHERE id = ?"
+    ).bind(att.memo_id).first<{ visibility: string; creator_id: number; space_id: number | null }>();
 
     if (memo) {
+      // Shares never apply to memos placed in a Space audience.
+      if (memo.visibility === "SPACE") {
+        hasShareAccess = false;
+      }
       if (!hasShareAccess) {
         const user = await resolveUserFromRequest(c);
         if (memo.visibility === "PRIVATE" && (!user || user.id !== memo.creator_id)) {
@@ -121,10 +151,20 @@ fileRoutes.get("/attachments/:uid/:filename", authOptional, async (c) => {
         if (memo.visibility === "PROTECTED" && !user) {
           return c.json({ error: "Authentication required" }, 401);
         }
+        if (memo.visibility === "SPACE") {
+          if (!user) {
+            return c.json({ error: "Authentication required" }, 401);
+          }
+          const allowed =
+            user.id === memo.creator_id ||
+            user.role === "ADMIN" ||
+            (memo.space_id !== null && (await spaceDB.isActiveSpaceMember(c.env.DB, memo.space_id, user.id)));
+          if (!allowed) {
+            return c.json({ error: "Permission denied" }, 403);
+          }
+        }
         if (memo.visibility === "PUBLIC") {
           cacheControl = "public, max-age=31536000, immutable";
-        } else if (user?.id === memo.creator_id) {
-          cacheControl = "private, max-age=300";
         }
       }
     } else {
@@ -151,16 +191,20 @@ fileRoutes.get("/attachments/:uid/:filename", authOptional, async (c) => {
     return c.notFound();
   }
 
-  let contentType = att.type || "application/octet-stream";
-  if (UNSAFE_MIME_TYPES.has(contentType)) {
-    contentType = "application/octet-stream";
-  }
+  const mediaType = (att.type || "").split(";", 1)[0].trim().toLowerCase();
+  const isInline = INLINE_MIME_TYPES.has(mediaType);
+  const contentType = isInline ? mediaType : "application/octet-stream";
 
   const headers: Record<string, string> = {
     "Content-Type": contentType,
     "Cache-Control": cacheControl,
     "Accept-Ranges": "bytes",
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "sandbox; default-src 'none'",
   };
+  if (!isInline) {
+    headers["Content-Disposition"] = getDownloadDisposition(att.filename);
+  }
 
   if (range && stored.partial) {
     headers["Content-Range"] = `bytes ${range.start}-${range.end}/${stored.size || att.size}`;

@@ -47,7 +47,7 @@
 
 ## 前置要求
 
-- Node.js >= 20
+- Node.js >= 22.13（后端安全回归测试使用 `node:sqlite`）
 - Wrangler CLI >= 4.14
 - Cloudflare 账号（Workers、D1；R2 / KV 可选）
 - 如需通过 Dashboard 导入 Git 仓库部署，需要一个包含 **D1: Edit** 权限的 API Token
@@ -140,7 +140,7 @@ npm run cf:deploy
 | `CFMEMOS_R2_BUCKET` | 可选 Variable。R2 存储桶名称，默认 `memos` |
 | `CFMEMOS_KV_NAME` | 可选 Variable。KV 命名空间名称，默认 `memos` |
 
-工作流会安装依赖、构建前端、创建或复用资源、执行迁移、写入 `JWT_SECRET` 并部署 Worker。版本号由 `scripts/fetch-github-version.mjs` 从上游 `usememos/memos` 的最新 Release 解析。
+工作流会安装依赖、运行后端与前端类型检查和测试、构建前端、创建或复用资源、执行迁移、写入 `JWT_SECRET` 并部署 Worker。版本号由 `scripts/fetch-github-version.mjs` 从上游 `usememos/memos` 的最新 Release 解析。
 
 ## 本地开发
 
@@ -150,6 +150,9 @@ cd web && npm install && cd ..
 
 npm run db:migrate   # 初始化本地 D1
 npm run dev          # Worker 后端，端口 8787
+
+npm test             # 后端路由 / SQL 安全回归测试（node:test + node:sqlite）
+cd web && npm test   # 前端单元与渲染安全测试
 ```
 
 另开一个终端：
@@ -181,26 +184,27 @@ JWT_SECRET=your-local-development-secret-at-least-32-characters
 │   ├── 0003_performance_indexes.sql
 │   └── 0004_spaces.sql        # 空间、SPACE 可见性、备忘录 space_id
 ├── worker/
-│   └── src/
-│       ├── index.ts           # Hono 入口与路由挂载
-│       ├── types.ts           # Env 绑定与 JWT 类型
-│       ├── routes/
-│       │   ├── auth.ts        # 登录 / 注册 / 刷新令牌
-│       │   ├── memos.ts       # 备忘录 CRUD、评论、反应、分享
-│       │   ├── users.ts       # 用户、设置、PAT、通知、Memo Views、用量
-│       │   ├── spaces.ts      # 空间、成员、邀请
-│       │   ├── attachments.ts # 附件上传与删除
-│       │   ├── files.ts       # 文件下载
-│       │   ├── instance.ts    # 实例配置、上传策略、统计
-│       │   ├── ai.ts          # Workers AI 转写
-│       │   ├── idp.ts         # SSO 身份提供商
-│       │   ├── shortcuts.ts
-│       │   └── sse.ts
-│       ├── auth/              # JWT、密码哈希、PAT
-│       ├── db/                # D1 查询模块（memo / space / user / setting 等）
-│       ├── filter/            # 备忘录过滤表达式编译
-│       ├── storage/           # R2 / S3 / WebDAV 与上传策略
-│       └── middleware/
+│   ├── src/
+│   │   ├── index.ts           # Hono 入口与路由挂载
+│   │   ├── types.ts           # Env 绑定与 JWT 类型
+│   │   ├── routes/
+│   │   │   ├── auth.ts        # 登录 / 注册 / 刷新令牌
+│   │   │   ├── memos.ts       # 备忘录 CRUD、评论、反应、分享
+│   │   │   ├── users.ts       # 用户、设置、PAT、通知、Memo Views、用量
+│   │   │   ├── spaces.ts      # 空间、成员、邀请
+│   │   │   ├── attachments.ts # 附件上传与删除
+│   │   │   ├── files.ts       # 文件下载与内容安全
+│   │   │   ├── instance.ts    # 实例配置、上传策略、统计
+│   │   │   ├── ai.ts          # Workers AI 转写
+│   │   │   ├── idp.ts         # SSO 身份提供商
+│   │   │   ├── shortcuts.ts
+│   │   │   └── sse.ts
+│   │   ├── auth/              # JWT、密码哈希、PAT、活跃用户校验
+│   │   ├── db/                # D1 查询模块（memo / space / user / setting 等）
+│   │   ├── filter/            # 备忘录过滤表达式编译
+│   │   ├── storage/           # R2 / S3 / WebDAV 与上传策略
+│   │   └── middleware/
+│   └── tests/                 # 安全回归测试（security.test.mjs）
 └── web/
     └── src/
         ├── connect.ts         # REST 客户端
@@ -230,6 +234,16 @@ JWT_SECRET=your-local-development-secret-at-least-32-characters
 | `/file/*` | 附件文件访问 |
 | `/u/:username/rss.xml` | 用户 RSS |
 | `/explore/rss.xml` | Explore RSS |
+
+## 安全
+
+- 每个需要认证的请求都会用 JWT 中的用户 ID 重新查询 D1；用户被归档、删除或降权后，旧 Token 立即失效。
+- 附件下载只对白名单 MIME（图片、音视频、PDF、纯文本）内联展示，其余类型强制下载；响应统一带 `X-Content-Type-Options: nosniff` 与 `Content-Security-Policy: sandbox`。
+- `Content-Disposition` 使用固定 ASCII 文件名 + UTF-8 编码文件名，避免响应头注入。
+- 登录后的重定向目标会进行同源、控制字符、编码路径规范化校验，拒绝 `//host`、`/auth/*` 等目标。
+- `SPACE` 附件只对空间成员、作者或管理员开放；`SPACE` 备忘录不能创建分享链接。
+- 普通用户不能修改自己的角色或账号状态；仅管理员可以归档 / 恢复用户或调整角色。
+- CI 与部署工作流都会执行 `worker/tests/security.test.mjs` 和前端安全 / 渲染回归测试。
 
 ## 配置
 

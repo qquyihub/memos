@@ -1432,6 +1432,9 @@ memoRoutes.post("/:id/shares", authRequired, async (c) => {
   if (memo.creator_id !== user.id && user.role !== "ADMIN") {
     return c.json({ error: "Permission denied" }, 403);
   }
+  if (memo.visibility === "SPACE") {
+    return c.json({ code: 9, message: "revoke active shares before using the SPACE audience", details: [] }, 400);
+  }
 
   const rawBody = await c.req.json<{
     memoShare?: { expireTime?: string };
@@ -1538,7 +1541,7 @@ shareRoutes.get("/shares/:shareId", authOptional, async (c) => {
   }
 
   const memo = await memoDB.getMemoById(c.env.DB, share.memo_id);
-  if (!memo) {
+  if (!memo || memo.visibility === "SPACE") {
     return c.json({ error: "Memo not found" }, 404);
   }
 
